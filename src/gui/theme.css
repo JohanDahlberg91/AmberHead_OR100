@@ -1,0 +1,169 @@
+/*
+ * Faceplate layout.
+ *
+ * NOTE: `font-size` is unitless in vizia and is scaled by 4/3 on the way to
+ * pixels, so `font-size: 9` renders at 12 px. Writing `9px` there makes the
+ * declaration unparseable and the whole rule is dropped.
+ *
+ * Colours for the canvas-drawn controls live in `src/gui/theme.rs`; this file
+ * only positions the containers and styles the text, so the two cannot drift.
+ * All units are logical pixels against the 920x340 editor from specification
+ * section 4, and every size is expressed relative to its parent so the whole
+ * faceplate scales cleanly from 75 % to 200 %.
+ */
+
+/* The chassis fills the window and sits behind every control. */
+.faceplate {
+    width: 1s;
+    height: 1s;
+}
+
+/* Main panel: inset past the orange stripes at top and bottom. */
+.panel {
+    width: 1s;
+    height: 1s;
+    child-top: 24px;
+    child-bottom: 22px;
+    child-left: 14px;
+    child-right: 14px;
+    col-between: 8px;
+}
+
+/* --- Brand block -------------------------------------------------------- */
+
+.brand {
+    width: 84px;
+    height: 1s;
+    child-left: 1s;
+    child-right: 1s;
+    child-top: 12px;
+    row-between: 6px;
+}
+
+.jewel {
+    width: 46px;
+    height: 46px;
+}
+
+.brand-mark {
+    color: #2A241C;
+    font-size: 9;
+    font-weight: thin;
+}
+
+.brand-model {
+    color: #B44606;
+    font-size: 13.5;
+    font-weight: light;
+}
+
+/* --- Knob banks --------------------------------------------------------- */
+
+.channel-group {
+    height: 1s;
+    width: auto;
+    row-between: 2px;
+}
+
+.knob-row {
+    height: 1s;
+    width: auto;
+    col-between: 2px;
+}
+
+.knob-cell {
+    width: 66px;
+    height: 1s;
+    child-left: 1s;
+    child-right: 1s;
+}
+
+knob {
+    width: 1s;
+    height: 1s;
+}
+
+.value-readout {
+    height: 15px;
+    width: 1s;
+    color: #6B6152;
+    font-size: 8.25;
+    font-weight: light;
+    text-align: center;
+}
+
+.group-caption {
+    height: 14px;
+    width: 1s;
+    color: #8C7E68;
+    font-size: 7.5;
+    font-weight: light;
+    text-align: center;
+}
+
+.divider {
+    width: 1px;
+    height: 1s;
+    top: 10px;
+    bottom: 26px;
+    background-color: #C8BCA4;
+}
+
+/* --- Switch bank -------------------------------------------------------- */
+
+.switch-bank {
+    width: 198px;
+    height: 1s;
+    row-between: 6px;
+    child-top: 2px;
+    child-bottom: 8px;
+}
+
+.switch-row {
+    width: 1s;
+    height: 1s;
+    col-between: 4px;
+    child-left: 1s;
+    child-right: 1s;
+}
+
+.switch-cell {
+    width: 60px;
+    height: 1s;
+    child-left: 1s;
+    child-right: 1s;
+    row-between: 1px;
+}
+
+bat-switch {
+    width: 30px;
+    height: 1s;
+}
+
+lever-switch {
+    width: 30px;
+    height: 1s;
+}
+
+.switch-caption {
+    height: 13px;
+    width: 1s;
+    color: #2A241C;
+    font-size: 7.5;
+    font-weight: light;
+    text-align: center;
+}
+
+.switch-value {
+    height: 12px;
+    width: 1s;
+    color: #8C7E68;
+    font-size: 6.75;
+    font-weight: light;
+    text-align: center;
+}
+
+/* Vizia's resize grip, tucked into the bottom-right stripe. */
+resize-handle {
+    color: #F2E9D6;
+}

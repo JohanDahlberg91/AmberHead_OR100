@@ -1,0 +1,53 @@
+[workspace]
+members = ["xtask"]
+resolver = "2"
+
+[package]
+name = "amberhead_or100"
+version = "0.1.0"
+edition = "2021"
+authors = ["AmberHead Audio"]
+license = "GPL-3.0-or-later"
+description = "Virtual analog recreation of the Orange OR100 Modern Reissue guitar amplifier"
+
+[lib]
+# `cdylib` is required for the VST3 / CLAP exports; `lib` keeps the DSP core
+# importable by the integration tests and the standalone binary.
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+# The name MUST match the package name: `nih_plug_xtask` locates the standalone
+# executable as `target/<profile>/<package_name>`, so renaming this target makes
+# `cargo xtask bundle` silently package a stale binary.
+#
+# Cargo emits an "output filename collision" warning on MSVC because the cdylib,
+# rlib and executable then share a `.pdb` basename. It is cosmetic — every
+# nih-plug plugin with a standalone target has the same layout — and it does not
+# affect the produced artifacts.
+name = "amberhead_or100"
+path = "src/bin/standalone.rs"
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7af4646065488a9845d8f8c2f95252c23", features = [
+    "assert_process_allocs",
+    "standalone",
+] }
+nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7af4646065488a9845d8f8c2f95252c23" }
+realfft = "3.5"
+wide = "1.6"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+codegen-units = 1
+# NOTE: `panic = "abort"` is deliberately absent. Cargo cannot build integration
+# tests against an `abort` rlib while the test harness itself unwinds, so
+# enabling it would make `cargo test --release` — the only profile in which the
+# DSP suite runs in reasonable time — impossible to build. Real-time safety is
+# instead enforced by the no-panic discipline in `CLAUDE.md` §1 and verified by
+# the `assert_process_allocs` feature.
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

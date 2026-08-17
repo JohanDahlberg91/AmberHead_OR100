@@ -1,0 +1,6 @@
+[alias]
+# `cargo xtask bundle amberhead_or100 --release` packages the VST3, CLAP and
+# standalone targets. The xtask package itself is built in release mode so its
+# `serde` dependency is not compiled twice when bundling release plugins.
+xtask = "run --package xtask --release --"
+xtask-debug = "run --package xtask --"

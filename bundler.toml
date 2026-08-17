@@ -1,0 +1,8 @@
+# Metadata for NIH-plug's `cargo xtask bundle` packager.
+#
+# `cargo xtask bundle amberhead_or100 --release` produces
+# `target/bundled/AmberHead OR100.vst3` and `.clap`, plus the standalone
+# executable, laid out per each format's platform conventions.
+
+[amberhead_or100]
+name = "AmberHead OR100"
