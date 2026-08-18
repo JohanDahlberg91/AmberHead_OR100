@@ -254,7 +254,7 @@ impl PowerAmp {
     /// Vout    = tanh(V+/Vsag) - tanh(V-/Vsag)
     /// ```
     ///
-    /// with the class-AB idle offset described at [`CLASS_AB_BIAS`].
+    /// with the class-AB idle offset described on the `CLASS_AB_BIAS` constant.
     #[inline(always)]
     pub fn process(&mut self, drive: [f32; 2]) -> f32 {
         let nominal = self.mode.nominal_b_plus() * self.rail_availability;

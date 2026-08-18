@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a failing DSP assertion is worth far more than the noise.
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # baseview/vizia link against X11, OpenGL and friends; without these the
+      # GUI crate fails to build on a bare runner.
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libgl-dev libjack-jackd2-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
+            libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libgl-dev libjack-jackd2-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
+            libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      # The DSP suite runs millions of oversampled samples; in a debug build it
+      # takes minutes rather than seconds. Release is also the only profile in
+      # which the counting-allocator real-time safety tests are compiled, since
+      # nih-plug owns the global allocator in debug builds.
+      - name: cargo test (release)
+        run: cargo test --release --all-targets
+
+      # A debug run additionally exercises every `debug_assert!` in the DSP and
+      # nih-plug's own `assert_process_allocs` allocator.
+      - name: cargo test (debug, DSP only)
+        run: cargo test --lib dsp::filters dsp::tonestack dsp::denormal
+
+  bundle:
+    name: Bundle on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: [lint, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
+          - os: macos-latest
+            artifact: macos-universal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libgl-dev libjack-jackd2-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev libxcursor-dev \
+            libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      # `cargo xtask bundle` produces the .vst3 / .clap directory layouts and
+      # the standalone executable that each platform's hosts expect.
+      - name: Bundle VST3, CLAP and standalone
+        run: cargo xtask bundle amberhead_or100 --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amberhead-or100-${{ matrix.artifact }}
+          path: target/bundled
+          if-no-files-found: error

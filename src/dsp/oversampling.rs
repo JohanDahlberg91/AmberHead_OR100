@@ -147,7 +147,7 @@ pub fn design_halfband<const TAPS: usize>(attenuation_db: f64) -> [f32; TAPS] {
 ///
 /// `TAPS` is the length of the `e0` polyphase branch and must be a multiple of
 /// 8 so the dot product vectorizes cleanly into [`f32x8`] lanes, and at most
-/// [`LINE`] so the doubled history buffer stays contiguous.
+/// `LINE` so the doubled history buffer stays contiguous.
 #[repr(align(64))]
 #[derive(Debug, Clone)]
 pub struct HalfBandStage<const TAPS: usize> {
