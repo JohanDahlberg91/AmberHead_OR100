@@ -365,3 +365,152 @@ fn the_engine_recovers_from_a_pathological_input_burst() {
     }
     assert!(peak < 1.0e-4, "engine failed to settle: {peak}");
 }
+
+/// The impulse response handoff, end to end, on the audio thread's terms.
+///
+/// This is the property that makes the cabinet loader safe to use while audio
+/// is running: collecting a published response and re-partitioning it touches
+/// only buffers that already exist.
+#[test]
+#[cfg(not(debug_assertions))]
+fn loading_an_impulse_response_allocates_nothing() {
+    use amberhead_or100::dsp::cabinet::IR_LENGTH;
+    use amberhead_or100::shared::IrSlot;
+
+    let controls = SampleControls::default();
+    let mut engine = prepared(&controls);
+
+    // Everything the audio thread will touch is built up front, exactly as
+    // `Plugin::initialize` does it.
+    let slot = IrSlot::new(IR_LENGTH);
+    let mut scratch = vec![0.0f32; IR_LENGTH];
+    let mut seen = slot.current_generation();
+
+    // Two responses, published from this thread as the editor would, and long
+    // enough to fill every partition.
+    let first: Vec<f32> = (0..IR_LENGTH).map(|n| 0.995f32.powi(n as i32)).collect();
+    let second: Vec<f32> = (0..IR_LENGTH)
+        .map(|n| 0.9f32.powi(n as i32) * if n % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
+
+    for _ in 0..1_024 {
+        engine.process_sample(0.1, &controls);
+    }
+
+    let before = allocation_count();
+    for round in 0..32 {
+        // The publish side is the editor's, not the audio thread's, and is
+        // allowed to allocate; it does not, but that is not what is asserted.
+        let taps = if round % 3 == 0 { &first } else { &second };
+        assert!(slot.publish(taps));
+
+        // This is the audio thread's half.
+        let collected = slot.collect(&mut seen, &mut scratch);
+        assert_eq!(collected, Some(IR_LENGTH), "the response was not collected");
+        if let Some(length) = collected {
+            if let Some(loaded) = scratch.get(..length) {
+                assert!(engine.load_impulse_response(loaded));
+            }
+        }
+
+        for _ in 0..256 {
+            let out = engine.process_sample(0.1, &controls);
+            assert!(out.is_finite(), "loading produced a non-finite sample");
+        }
+    }
+    let after = allocation_count();
+
+    // The publishes above run on this thread and are counted too, so the
+    // budget is not zero — but it must be bounded by the number of publishes
+    // rather than growing with the audio processed.
+    assert!(
+        after - before < 32 * 4,
+        "loading impulse responses performed {} allocations",
+        after - before
+    );
+
+    // And the same for the revert path, which must not allocate at all.
+    let before = allocation_count();
+    for _ in 0..32 {
+        assert!(slot.publish_default());
+        if let Some(length) = slot.collect(&mut seen, &mut scratch) {
+            assert_eq!(length, 0);
+            assert!(engine.restore_default_impulse_response());
+        }
+        for _ in 0..256 {
+            assert!(engine.process_sample(0.1, &controls).is_finite());
+        }
+    }
+    assert_eq!(
+        before,
+        allocation_count(),
+        "restoring the built-in cabinet touched the heap"
+    );
+}
+
+/// A loaded cabinet must actually change the sound, and must survive a reset.
+#[test]
+fn a_loaded_impulse_response_changes_the_output_and_survives_reset() {
+    use amberhead_or100::dsp::cabinet::IR_LENGTH;
+
+    let controls = SampleControls::default();
+
+    let peak_of = |engine: &mut AmpEngine| -> f32 {
+        let settle = (SAMPLE_RATE * 0.2) as usize;
+        for n in 0..settle {
+            let x = (std::f32::consts::TAU * 220.0 * n as f32 / SAMPLE_RATE).sin();
+            engine.process_sample(x, &controls);
+        }
+        let mut peak = 0.0f32;
+        for n in 0..(SAMPLE_RATE * 0.1) as usize {
+            let x = (std::f32::consts::TAU * 220.0 * (settle + n) as f32 / SAMPLE_RATE).sin();
+            peak = peak.max(engine.process_sample(x, &controls).abs());
+        }
+        peak
+    };
+
+    let mut engine = prepared(&controls);
+    let built_in = peak_of(&mut engine);
+
+    // A short, bright response: nothing like the synthesised 4x12.
+    let mut taps = vec![0.0f32; IR_LENGTH];
+    if let Some(tap) = taps.get_mut(0) {
+        *tap = 1.0;
+    }
+    if let Some(tap) = taps.get_mut(3) {
+        *tap = -0.6;
+    }
+    assert!(engine.load_impulse_response(&taps));
+    let loaded = peak_of(&mut engine);
+
+    assert!(loaded.is_finite() && loaded > 0.0);
+    assert!(
+        (loaded - built_in).abs() > built_in * 0.05,
+        "loading a completely different cabinet changed nothing: {built_in} vs {loaded}"
+    );
+
+    // Band normalisation means the two are within a few dB of each other, so
+    // swapping cabinets does not need the output fader moved.
+    let difference_db = 20.0 * (loaded / built_in).log10();
+    assert!(
+        difference_db.abs() < 12.0,
+        "the level jumped {difference_db} dB when the cabinet was swapped"
+    );
+
+    // A reset clears the tail but keeps the loaded response.
+    let after_reset = {
+        engine.reset();
+        peak_of(&mut engine)
+    };
+    assert!(
+        (after_reset - loaded).abs() < loaded * 0.02,
+        "reset lost the loaded cabinet: {loaded} -> {after_reset}"
+    );
+
+    assert!(engine.restore_default_impulse_response());
+    let restored = peak_of(&mut engine);
+    assert!(
+        (restored - built_in).abs() < built_in * 0.02,
+        "restoring did not recover the built-in cabinet: {built_in} -> {restored}"
+    );
+}

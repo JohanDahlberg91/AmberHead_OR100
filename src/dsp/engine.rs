@@ -41,8 +41,10 @@ use super::{audio_taper, knob_to_rotation};
 pub const INPUT_DRIVE_VOLTS: f32 = 0.35;
 
 /// Final scaling from the transformer secondary into the host's normalized
-/// range, chosen so that the default patch (dirty channel, gain 6.5,
-/// volume 5.0, 100 W) peaks near -10 dBFS on a full-scale input.
+/// range, chosen so that a full-scale input on the default patch (dirty
+/// channel, gain 6.5, volume 5.0, 100 W) peaks at -2.7 dBFS: hot, but with
+/// the headroom for the loudest setting the front panel can reach — gain and
+/// volume both at 10 — to land at -0.3 dBFS rather than clipping the host bus.
 pub const OUTPUT_CALIBRATION: f32 = 0.34;
 
 /// Divider between V1's plate and the clean channel's tone stack.
@@ -50,9 +52,13 @@ const CLEAN_STACK_DRIVE: f32 = 0.35;
 /// Makeup applied after the clean tone stack's insertion loss, so the clean
 /// channel can still reach power-stage breakup at high volume settings.
 ///
-/// Calibrated so the clean channel stays clean at its middle volume setting —
-/// a full-scale input at volume 5 lands near -18 dBFS with the power stage
-/// barely working — and only reaches power-stage breakup towards volume 10.
+/// At 6.0 a full-scale input at volume 5 lands at -4.3 dBFS, which is level
+/// with the dirty channel rather than dropping away when the channel switch is
+/// thrown. That is a hot setting: the clean channel is already working the
+/// power stage at volume 5 and gains under a decibel between there and volume
+/// 10, so its top half is an edge-of-breakup range rather than a clean one —
+/// which is what an OR100's clean channel does, having no master volume of its
+/// own between the tone stack and the phase inverter.
 const CLEAN_MAKEUP: f32 = 6.0;
 
 /// Fixed divider between V2's plate and the gain pot.
@@ -349,6 +355,22 @@ impl AmpEngine {
     /// The impulse response the cabinet stage is currently using.
     pub fn impulse_response(&self) -> &[f32] {
         self.cabinet.impulse_response()
+    }
+
+    /// Swaps in a measured impulse response.
+    ///
+    /// Delegates to [`Cabinet::load_ir`], which copies into buffers that
+    /// already exist and re-runs the partitioning transforms in place, so this
+    /// allocates nothing and is safe to call between blocks on the audio
+    /// thread. Returns `false` if the engine is unprepared or the taps are
+    /// unusable, leaving the previous cabinet running.
+    pub fn load_impulse_response(&mut self, taps: &[f32]) -> bool {
+        self.prepared && self.cabinet.load_ir(taps)
+    }
+
+    /// Puts the synthesised 4x12 response back. Allocation-free, as above.
+    pub fn restore_default_impulse_response(&mut self) -> bool {
+        self.prepared && self.cabinet.restore_default_ir()
     }
 
     /// Re-solves the tone stacks and applies discrete switch positions.

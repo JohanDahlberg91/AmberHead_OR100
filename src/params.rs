@@ -9,7 +9,7 @@
 //! is the only place where `nih-plug` parameter types and DSP enumerations
 //! meet, which keeps the amplifier model host-agnostic and unit-testable.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
@@ -121,6 +121,16 @@ pub struct Or100Params {
     #[persist = "editor-state"]
     pub editor_state: Arc<ViziaState>,
 
+    /// Absolute path of the impulse response WAV the cabinet stage is using,
+    /// or empty for the built-in 4x12.
+    ///
+    /// Persisted rather than automated: it is a file reference, which has no
+    /// meaningful normalized range and which a host cannot sensibly ramp. The
+    /// editor writes it, and `Plugin::initialize` reads it back and reloads the
+    /// file so that a saved project reopens with the same cabinet.
+    #[persist = "ir-path"]
+    pub ir_path: Arc<RwLock<String>>,
+
     #[id = "channel"]
     pub channel: EnumParam<ChannelParam>,
 
@@ -188,6 +198,7 @@ impl Default for Or100Params {
     fn default() -> Self {
         Self {
             editor_state: crate::gui::default_state(),
+            ir_path: Arc::new(RwLock::new(String::new())),
 
             channel: EnumParam::new("Channel Select", ChannelParam::Dirty),
 
@@ -304,9 +315,35 @@ mod tests {
     #[test]
     fn the_schema_declares_exactly_fourteen_parameters() {
         let params = Or100Params::default();
-        // `editor_state` is persisted state, not an automatable parameter, so
-        // it must not appear here.
+        // `editor_state` and `ir_path` are persisted state, not automatable
+        // parameters, so neither may appear here.
         assert_eq!(params.param_map().len(), 14);
+    }
+
+    #[test]
+    fn the_impulse_response_path_starts_empty_and_round_trips() {
+        let params = Or100Params::default();
+        assert_eq!(
+            params
+                .ir_path
+                .read()
+                .map(|path| path.clone())
+                .unwrap_or_else(|_| "poisoned".into()),
+            "",
+            "a fresh instance must start on the built-in cabinet"
+        );
+
+        if let Ok(mut path) = params.ir_path.write() {
+            *path = "C:/cabs/v30.wav".into();
+        }
+        assert_eq!(
+            params
+                .ir_path
+                .read()
+                .map(|path| path.clone())
+                .unwrap_or_default(),
+            "C:/cabs/v30.wav"
+        );
     }
 
     #[test]

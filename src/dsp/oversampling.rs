@@ -77,8 +77,9 @@ const STAGE3_ATTENUATION_DB: f64 = 70.0;
 ///
 /// Evaluated by its Maclaurin series `I0(x) = sum_k ((x/2)^k / k!)^2`, which
 /// converges in well under 40 terms for the `beta <= 11` range used by the
-/// Kaiser windows here. Only called during `prepare()`.
-fn bessel_i0(x: f64) -> f64 {
+/// Kaiser windows here. Only called during `prepare()` and, for the same
+/// window shape, by the resampler in [`crate::ir`].
+pub(crate) fn bessel_i0(x: f64) -> f64 {
     let half_x = x * 0.5;
     let mut term = 1.0f64;
     let mut sum = 1.0f64;
@@ -95,7 +96,7 @@ fn bessel_i0(x: f64) -> f64 {
 
 /// Normalized sinc, `sin(pi*x) / (pi*x)`, with the removable singularity at
 /// `x == 0` filled in.
-fn sinc(x: f64) -> f64 {
+pub(crate) fn sinc(x: f64) -> f64 {
     if x.abs() < 1.0e-12 {
         1.0
     } else {

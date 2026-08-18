@@ -3,21 +3,33 @@
 //!
 //! Specification section 6, phase 4.
 //!
-//! # About the impulse response
+//! # About the default impulse response
 //!
-//! The IR is **synthesised** by [`synthesise_4x12_ir`] from a documented filter
-//! cascade rather than being a sampled measurement of a physical Celestion
-//! Vintage 30 cabinet. Shipping a real measurement would mean redistributing
-//! someone else's copyrighted recording, so the default cab here is a model of
-//! the same target: driver low-frequency tuning, cone-breakup peak, the
-//! upper-midrange notch a closed 4x12 produces off-axis, the voice-coil
-//! inductance rolloff, and the early cabinet reflection that gives a 4x12 its
-//! comb structure. Every corner frequency, `Q` and gain is stated as a constant
-//! below so the voicing can be re-tuned against a measurement.
+//! The IR the plugin starts with is **synthesised** by [`synthesise_4x12_ir`]
+//! from a documented filter cascade rather than being a sampled measurement of
+//! a physical Celestion Vintage 30 cabinet. Shipping a real measurement would
+//! mean redistributing someone else's copyrighted recording, so the default cab
+//! here is a model of the same target: driver low-frequency tuning, cone-breakup
+//! peak, the upper-midrange notch a closed 4x12 produces off-axis, the
+//! voice-coil inductance rolloff, and the early cabinet reflection that gives a
+//! 4x12 its comb structure. Every corner frequency, `Q` and gain is stated as a
+//! constant below so the voicing can be re-tuned against a measurement.
 //!
 //! Because the response is generated rather than stored, it is rebuilt in
 //! [`Cabinet::prepare`] whenever the host sample rate changes and is therefore
 //! correct at every rate, which a fixed 48 kHz WAV would not be.
+//!
+//! # Loading a measured impulse response
+//!
+//! [`Cabinet::load_ir`] replaces the running response with an arbitrary set of
+//! taps, and [`Cabinet::restore_default_ir`] puts the synthesised one back. Both
+//! re-run the partitioning transforms in place, so neither allocates and both
+//! are safe to call from the audio thread — the file decoding that produces
+//! those taps happens on the editor thread, in [`crate::ir`].
+//!
+//! Both paths normalise through [`normalise_to_reference_band`], so swapping
+//! cabinets changes the voicing without changing the level, and the amplifier's
+//! single output calibration stays valid whichever response is loaded.
 //!
 //! # Partitioning and latency
 //!
@@ -46,15 +58,40 @@ pub const PARTITION: usize = 64;
 pub const FFT_SIZE: usize = PARTITION * 2;
 /// Number of complex bins a real FFT of [`FFT_SIZE`] produces.
 pub const SPECTRUM_BINS: usize = FFT_SIZE / 2 + 1;
-/// Impulse response length in samples. 1024 taps is 21 ms at 48 kHz, well past
-/// the point where a close-mic'd 4x12 has decayed into the noise floor.
-pub const IR_LENGTH: usize = 1024;
+/// Impulse response length in samples.
+///
+/// 4096 taps is 85 ms at 48 kHz and 43 ms at 96 kHz. The synthesised cab has
+/// decayed into insignificance within a quarter of that; the length is set by
+/// what a *loaded* response needs, since commercial cabinet IRs are commonly
+/// distributed at 200 ms and carry room tail well past the point where a
+/// close-mic'd 4x12 has gone quiet. Anything longer than this is truncated with
+/// a fade, which [`crate::ir`] applies before handing the taps over.
+pub const IR_LENGTH: usize = 4096;
 /// Number of uniform partitions the IR is split into.
 pub const PARTITIONS: usize = IR_LENGTH / PARTITION;
 
-/// Frequency at which the synthesised IR is normalised to unity gain, so that
-/// engaging the cabinet does not change the perceived level.
-const NORMALISATION_HZ: f32 = 250.0;
+/// Low edge of the band an impulse response is normalised against.
+const NORMALISATION_LOW_HZ: f32 = 100.0;
+/// High edge of that band.
+///
+/// 100 Hz to 1 kHz is the range where every guitar cabinet has its body and
+/// none has its character, which makes it a stable level reference across very
+/// differently voiced responses.
+const NORMALISATION_HIGH_HZ: f32 = 1_000.0;
+/// Logarithmically spaced probe frequencies across the normalisation band.
+///
+/// A single probe frequency is not usable for arbitrary loaded responses: a
+/// measured cabinet can have a deep null anywhere, and normalising on top of
+/// one would boost that IR by however many dB the null happens to be. Taking
+/// the RMS of the magnitude across a band makes the reference insensitive to
+/// any individual null.
+const NORMALISATION_POINTS: usize = 33;
+/// Widest correction [`normalise_to_reference_band`] will apply, in dB.
+///
+/// A response that needs more than this is not a cabinet IR — it is silence,
+/// or a file the decoder misread — and scaling it by the raw factor would
+/// amplify whatever noise it does contain into the signal path.
+const NORMALISATION_LIMIT_DB: f32 = 40.0;
 
 /// Driver/enclosure resonance: the low-frequency corner of a closed 4x12.
 const RESONANCE_HZ: f32 = 85.0;
@@ -83,10 +120,77 @@ const BODY_GAIN_DB: f32 = -3.5;
 const REFLECTION_SECONDS: f32 = 0.000_36;
 const REFLECTION_GAIN: f32 = -0.4;
 
+/// Magnitude of an impulse response at `frequency`, evaluated directly from
+/// the taps.
+///
+/// A goertzel-style single-bin DFT rather than a full transform: the caller
+/// only ever wants a handful of frequencies, and the taps are short enough that
+/// the direct sum is both faster and free of the windowing error a padded FFT
+/// would introduce.
+fn response_magnitude(ir: &[f32], frequency: f32, sample_rate: f32) -> f64 {
+    let step = -std::f64::consts::TAU * frequency as f64 / sample_rate as f64;
+    let (mut real, mut imag) = (0.0f64, 0.0f64);
+    for (index, tap) in ir.iter().enumerate() {
+        let phase = step * index as f64;
+        real += *tap as f64 * phase.cos();
+        imag += *tap as f64 * phase.sin();
+    }
+    (real * real + imag * imag).sqrt()
+}
+
+/// RMS magnitude of `ir` across the normalisation band, in linear gain.
+///
+/// Returns 0.0 for a silent or degenerate response.
+pub fn reference_band_gain(ir: &[f32], sample_rate: f32) -> f32 {
+    if ir.is_empty() || !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return 0.0;
+    }
+    // Never probe above Nyquist, which a very low host rate could put below
+    // NORMALISATION_HIGH_HZ.
+    let high = NORMALISATION_HIGH_HZ.min(sample_rate * 0.45);
+    if high <= NORMALISATION_LOW_HZ {
+        return response_magnitude(ir, NORMALISATION_LOW_HZ.min(high), sample_rate) as f32;
+    }
+
+    let ratio = (high / NORMALISATION_LOW_HZ) as f64;
+    let last = (NORMALISATION_POINTS - 1) as f64;
+    let mut sum = 0.0f64;
+    for point in 0..NORMALISATION_POINTS {
+        let frequency = NORMALISATION_LOW_HZ as f64 * ratio.powf(point as f64 / last);
+        let magnitude = response_magnitude(ir, frequency as f32, sample_rate);
+        sum += magnitude * magnitude;
+    }
+    (sum / NORMALISATION_POINTS as f64).sqrt() as f32
+}
+
+/// Scales `ir` in place so its [`reference_band_gain`] is unity.
+///
+/// Returns `false` and leaves the taps untouched when the response is silent,
+/// non-finite, or would need more than `NORMALISATION_LIMIT_DB` (40 dB) of
+/// correction — every case in which scaling would do harm rather than good.
+pub fn normalise_to_reference_band(ir: &mut [f32], sample_rate: f32) -> bool {
+    if ir.iter().any(|tap| !tap.is_finite()) {
+        return false;
+    }
+    let gain = reference_band_gain(ir, sample_rate);
+    if !gain.is_finite() || gain <= 0.0 {
+        return false;
+    }
+    let scale = 1.0 / gain;
+    let limit = 10.0f32.powf(NORMALISATION_LIMIT_DB / 20.0);
+    if scale > limit || scale < 1.0 / limit {
+        return false;
+    }
+    for tap in ir.iter_mut() {
+        *tap *= scale;
+    }
+    true
+}
+
 /// Generates the default 4x12 impulse response at `sample_rate`.
 ///
 /// The response is the impulse response of the documented biquad cascade plus a
-/// single early reflection, normalised so that `|H(250 Hz)| == 1`.
+/// single early reflection, normalised through [`normalise_to_reference_band`].
 pub fn synthesise_4x12_ir(sample_rate: f32) -> Vec<f32> {
     let mut chain = [
         Biquad::highpass(RESONANCE_HZ, RESONANCE_Q, sample_rate),
@@ -117,22 +221,11 @@ pub fn synthesise_4x12_ir(sample_rate: f32) -> Vec<f32> {
         }
     }
 
-    // Normalise to unity at NORMALISATION_HZ.
-    let mut real = 0.0f64;
-    let mut imag = 0.0f64;
-    for (index, tap) in response.iter().enumerate() {
-        let phase =
-            -std::f64::consts::TAU * NORMALISATION_HZ as f64 * index as f64 / sample_rate as f64;
-        real += *tap as f64 * phase.cos();
-        imag += *tap as f64 * phase.sin();
-    }
-    let magnitude = (real * real + imag * imag).sqrt();
-    if magnitude > 1.0e-9 {
-        let scale = (1.0 / magnitude) as f32;
-        for tap in response.iter_mut() {
-            *tap *= scale;
-        }
-    }
+    // The cascade is a unity-gain-at-DC-ish filter chain whose absolute level
+    // is an accident of its `Q` values, so the result is always renormalised.
+    // A failure here would mean the cascade produced silence, which the
+    // `ir_has_the_expected_length_and_is_finite` test rules out.
+    normalise_to_reference_band(&mut response, sample_rate);
 
     response
 }
@@ -171,8 +264,15 @@ pub struct Cabinet {
     bypass_delay: [f32; PARTITION],
     cursor: usize,
 
-    /// The generated impulse response, retained for inspection and tests.
+    /// The impulse response currently convolved with, `IR_LENGTH` long once
+    /// prepared. Retained so a loaded response can be inspected and so
+    /// [`Self::load_ir`] has somewhere to copy into without allocating.
     impulse_response: Vec<f32>,
+    /// The synthesised default, kept so [`Self::restore_default_ir`] can put it
+    /// back without re-running the biquad cascade on the audio thread.
+    default_response: Vec<f32>,
+    /// Host sample rate the current response was built for.
+    sample_rate: f32,
     prepared: bool,
 }
 
@@ -202,6 +302,8 @@ impl Cabinet {
             bypass_delay: [0.0; PARTITION],
             cursor: 0,
             impulse_response: Vec::new(),
+            default_response: Vec::new(),
+            sample_rate: 0.0,
             prepared: false,
         }
     }
@@ -230,40 +332,122 @@ impl Cabinet {
         self.history = vec![0.0; FFT_SIZE];
         self.delay_line = vec![Complex::new(0.0, 0.0); PARTITIONS * SPECTRUM_BINS];
         self.ir_spectra = vec![Complex::new(0.0, 0.0); PARTITIONS * SPECTRUM_BINS];
-        self.impulse_response = synthesise_4x12_ir(sample_rate);
-
-        // Transform each IR partition, zero-padded into the upper half of the
-        // FFT frame as overlap-save requires.
-        for partition in 0..PARTITIONS {
-            let mut block = vec![0.0f32; FFT_SIZE];
-            for sample in 0..PARTITION {
-                let source = partition * PARTITION + sample;
-                if let (Some(destination), Some(value)) = (
-                    block.get_mut(sample),
-                    self.impulse_response.get(source).copied(),
-                ) {
-                    *destination = value;
-                }
-            }
-            let start = partition * SPECTRUM_BINS;
-            let Some(target) = self.ir_spectra.get_mut(start..start + SPECTRUM_BINS) else {
-                self.prepared = false;
-                return false;
-            };
-            if forward
-                .process_with_scratch(&mut block, target, &mut self.fft_scratch)
-                .is_err()
-            {
-                self.prepared = false;
-                return false;
-            }
-        }
+        self.default_response = synthesise_4x12_ir(sample_rate);
+        self.impulse_response = self.default_response.clone();
+        self.sample_rate = sample_rate;
 
         self.forward = Some(forward);
         self.inverse = Some(inverse);
+        if !self.repartition() {
+            self.forward = None;
+            self.inverse = None;
+            self.prepared = false;
+            return false;
+        }
+
         self.prepared = true;
         self.reset();
         true
+    }
+
+    /// Transforms every partition of `impulse_response` into `ir_spectra`.
+    ///
+    /// Allocation-free: the only scratch it touches is `time_buffer` and
+    /// `fft_scratch`, both sized by [`Self::prepare`]. Returns `false` if a
+    /// buffer is the wrong size or a transform rejected its arguments, which
+    /// can only happen before `prepare` has run.
+    fn repartition(&mut self) -> bool {
+        // Destructured so the source response, the scratch and the destination
+        // spectra can be borrowed at once.
+        let Self {
+            forward,
+            ir_spectra,
+            fft_scratch,
+            time_buffer,
+            impulse_response,
+            ..
+        } = self;
+        let Some(forward) = forward.as_ref() else {
+            return false;
+        };
+        if time_buffer.len() < FFT_SIZE || ir_spectra.len() < PARTITIONS * SPECTRUM_BINS {
+            return false;
+        }
+
+        for partition in 0..PARTITIONS {
+            // Each partition is zero-padded into the upper half of the FFT
+            // frame, as overlap-save requires.
+            for (sample, slot) in time_buffer.iter_mut().enumerate().take(FFT_SIZE) {
+                *slot = if sample < PARTITION {
+                    impulse_response
+                        .get(partition * PARTITION + sample)
+                        .copied()
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+            }
+
+            let start = partition * SPECTRUM_BINS;
+            let Some(target) = ir_spectra.get_mut(start..start + SPECTRUM_BINS) else {
+                return false;
+            };
+            if forward
+                .process_with_scratch(time_buffer, target, fft_scratch)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Replaces the running impulse response with `taps`.
+    ///
+    /// `taps` is copied into the existing [`IR_LENGTH`]-long buffer, truncated
+    /// or zero-padded to fit, normalised through [`normalise_to_reference_band`]
+    /// and re-partitioned. Nothing is allocated and nothing is locked, so this
+    /// is safe to call from the audio thread; the caller is expected to have
+    /// applied any fade-out before truncation, which [`crate::ir`] does.
+    ///
+    /// Returns `false` and leaves the previous response running if the cabinet
+    /// is not prepared, if `taps` is empty, or if the response is silent or
+    /// non-finite. The convolver's delay line is deliberately *not* cleared:
+    /// the tail already in flight belongs to audio that was played through the
+    /// old cabinet, and discarding it would put a gap in the output.
+    pub fn load_ir(&mut self, taps: &[f32]) -> bool {
+        if !self.prepared || taps.is_empty() || self.impulse_response.len() < IR_LENGTH {
+            return false;
+        }
+        if taps.iter().any(|tap| !tap.is_finite()) {
+            return false;
+        }
+
+        for (index, slot) in self.impulse_response.iter_mut().enumerate() {
+            *slot = taps.get(index).copied().unwrap_or(0.0);
+        }
+        if !normalise_to_reference_band(&mut self.impulse_response, self.sample_rate) {
+            // Put the previous response back rather than convolving with
+            // something that could not be levelled.
+            self.impulse_response
+                .copy_from_slice(&self.default_response);
+            self.repartition();
+            return false;
+        }
+        self.repartition()
+    }
+
+    /// Puts the synthesised 4x12 response back.
+    ///
+    /// Allocation-free for the same reason [`Self::load_ir`] is: the default
+    /// taps were generated once in [`Self::prepare`] and have been held since.
+    pub fn restore_default_ir(&mut self) -> bool {
+        if !self.prepared || self.default_response.len() != self.impulse_response.len() {
+            return false;
+        }
+        self.impulse_response
+            .copy_from_slice(&self.default_response);
+        self.repartition()
     }
 
     /// Clears every delay line and the collected block, keeping the IR.
@@ -447,10 +631,178 @@ mod tests {
     }
 
     #[test]
-    fn ir_is_normalised_at_the_reference_frequency() {
+    fn ir_is_normalised_across_the_reference_band() {
         let ir = synthesise_4x12_ir(FS);
-        let db = ir_response_db(&ir, NORMALISATION_HZ);
-        assert!(db.abs() < 0.5, "250 Hz gain was {db} dB");
+        let db = 20.0 * reference_band_gain(&ir, FS).log10();
+        assert!(db.abs() < 0.01, "band gain was {db} dB");
+    }
+
+    #[test]
+    fn band_normalisation_is_insensitive_to_a_single_null() {
+        // The point of normalising across a band rather than at one frequency:
+        // a comb null landing on the probe must not send the level anywhere.
+        // A two-tap comb `1 + z^-d` has magnitude `2|cos(w*d/2)|`, so it nulls
+        // exactly at fs / (2d).
+        let notch_hz = 250.0f32;
+        let delay = (FS / (2.0 * notch_hz)).round() as usize;
+        let mut combed = vec![0.0f32; IR_LENGTH];
+        if let Some(tap) = combed.get_mut(0) {
+            *tap = 1.0;
+        }
+        if let Some(tap) = combed.get_mut(delay) {
+            *tap = 1.0;
+        }
+
+        // The null is real and deep at the frequency a single-point reference
+        // would have used.
+        let at_null = response_magnitude(&combed, notch_hz, FS);
+        assert!(
+            at_null < 1.0e-3,
+            "the comb does not null at 250 Hz: {at_null}"
+        );
+
+        // Yet the band reference is a perfectly ordinary number, so the
+        // correction applied stays small.
+        assert!(normalise_to_reference_band(&mut combed, FS));
+        let peak = combed.iter().fold(0.0f32, |peak, tap| peak.max(tap.abs()));
+        assert!(
+            (0.3..=3.0).contains(&peak),
+            "a null at the probe frequency skewed the level: peak {peak}"
+        );
+    }
+
+    #[test]
+    fn normalisation_refuses_responses_it_cannot_level() {
+        let mut silent = vec![0.0f32; 256];
+        assert!(!normalise_to_reference_band(&mut silent, FS));
+        assert!(silent.iter().all(|tap| *tap == 0.0), "silence was scaled");
+
+        let mut broken = vec![0.0f32; 256];
+        if let Some(tap) = broken.get_mut(0) {
+            *tap = f32::NAN;
+        }
+        assert!(!normalise_to_reference_band(&mut broken, FS));
+
+        // A response needing more than NORMALISATION_LIMIT_DB of lift is
+        // rejected rather than amplified.
+        let mut tiny = vec![0.0f32; 256];
+        if let Some(tap) = tiny.get_mut(0) {
+            *tap = 1.0e-6;
+        }
+        assert!(!normalise_to_reference_band(&mut tiny, FS));
+        assert_eq!(tiny.first().copied().unwrap_or(0.0), 1.0e-6);
+
+        assert!(!normalise_to_reference_band(&mut [], FS));
+        assert_eq!(reference_band_gain(&[], FS), 0.0);
+        assert_eq!(reference_band_gain(&[1.0], 0.0), 0.0);
+    }
+
+    #[test]
+    fn loading_an_ir_replaces_the_convolved_response() {
+        let mut cabinet = prepared();
+
+        // A one-pole lowpass, obviously different from the default cab and
+        // trivially checkable in the output.
+        let mut taps = vec![0.0f32; IR_LENGTH];
+        let mut value = 1.0f32;
+        for tap in taps.iter_mut() {
+            *tap = value;
+            value *= 0.98;
+        }
+        assert!(cabinet.load_ir(&taps), "load_ir refused a valid response");
+
+        // The convolver now reproduces the loaded response, normalised.
+        let loaded = cabinet.impulse_response().to_vec();
+        assert_eq!(loaded.len(), IR_LENGTH);
+        let db = 20.0 * reference_band_gain(&loaded, FS).log10();
+        assert!(db.abs() < 0.01, "loaded IR not levelled: {db} dB");
+
+        let mut output = vec![cabinet.process(1.0, true)];
+        for _ in 1..(IR_LENGTH + 2 * PARTITION) {
+            output.push(cabinet.process(0.0, true));
+        }
+        let mut worst = 0.0f32;
+        for (index, expected) in loaded.iter().enumerate() {
+            let actual = output.get(index + PARTITION).copied().unwrap_or(0.0);
+            worst = worst.max((actual - expected).abs());
+        }
+        assert!(worst < 1.0e-5, "loaded convolution error {worst}");
+    }
+
+    #[test]
+    fn restoring_the_default_recovers_the_synthesised_response() {
+        let mut cabinet = prepared();
+        let original = cabinet.impulse_response().to_vec();
+
+        let taps = vec![1.0f32; 512];
+        assert!(cabinet.load_ir(&taps));
+        assert_ne!(cabinet.impulse_response(), original.as_slice());
+
+        assert!(cabinet.restore_default_ir());
+        assert_eq!(cabinet.impulse_response(), original.as_slice());
+    }
+
+    #[test]
+    fn loading_rejects_bad_input_and_keeps_playing() {
+        let mut cabinet = prepared();
+        let original = cabinet.impulse_response().to_vec();
+
+        assert!(!cabinet.load_ir(&[]), "an empty response was accepted");
+        assert!(
+            !cabinet.load_ir(&[1.0, f32::NAN, 0.5]),
+            "a non-finite response was accepted"
+        );
+        assert!(
+            !cabinet.load_ir(&[0.0; 256]),
+            "a silent response was accepted"
+        );
+        assert_eq!(
+            cabinet.impulse_response(),
+            original.as_slice(),
+            "a rejected load disturbed the running response"
+        );
+
+        // And an unprepared cabinet refuses rather than panicking.
+        let mut fresh = Cabinet::new();
+        assert!(!fresh.load_ir(&[1.0, 0.5]));
+        assert!(!fresh.restore_default_ir());
+    }
+
+    #[test]
+    fn loading_shorter_and_longer_responses_both_work() {
+        let mut cabinet = prepared();
+
+        // Shorter than IR_LENGTH: the remainder must be zero-filled, not left
+        // holding the previous response.
+        let short = vec![1.0f32; 8];
+        assert!(cabinet.load_ir(&short));
+        assert!(
+            cabinet
+                .impulse_response()
+                .iter()
+                .skip(8)
+                .all(|tap| *tap == 0.0),
+            "the tail of the previous IR survived a shorter load"
+        );
+
+        // Longer than IR_LENGTH: the excess is dropped, not wrapped.
+        let mut long = vec![0.0f32; IR_LENGTH * 2];
+        for (index, tap) in long.iter_mut().enumerate() {
+            *tap = if index < IR_LENGTH { 1.0 } else { 9.0 };
+        }
+        assert!(cabinet.load_ir(&long));
+        let peak = cabinet
+            .impulse_response()
+            .iter()
+            .fold(0.0f32, |peak, tap| peak.max(tap.abs()));
+        let smallest = cabinet
+            .impulse_response()
+            .iter()
+            .fold(f32::INFINITY, |low, tap| low.min(tap.abs()));
+        assert!(
+            (peak - smallest).abs() < 1.0e-6,
+            "taps past IR_LENGTH leaked in: {smallest} .. {peak}"
+        );
     }
 
     #[test]

@@ -5,77 +5,191 @@
  * pixels, so `font-size: 9` renders at 12 px. Writing `9px` there makes the
  * declaration unparseable and the whole rule is dropped.
  *
+ * GEOMETRY: the `left`/`top`/`width`/`height` of `.header` and `.control-bar`,
+ * and the widths of the three `.cell-*` rules, MUST match the constants in
+ * `src/gui/chassis.rs` — that module paints the surfaces these containers sit
+ * on. `gui::tests::the_stylesheet_agrees_with_the_painted_chassis` reads this
+ * file and checks every one of those numbers, so a change here that is not
+ * mirrored there fails the build rather than sliding a knob half off its cell.
+ *
  * Colours for the canvas-drawn controls live in `src/gui/theme.rs`; this file
  * only positions the containers and styles the text, so the two cannot drift.
  * All units are logical pixels against the 920x340 editor from specification
- * section 4, and every size is expressed relative to its parent so the whole
- * faceplate scales cleanly from 75 % to 200 %.
+ * section 4, and the chassis is redrawn proportionally at every scale factor,
+ * so the whole faceplate scales cleanly from 75 % to 200 %.
  */
 
-/* The chassis fills the window and sits behind every control. */
+/* The amplifier head fills the window and sits behind every control. */
 .faceplate {
     width: 1s;
     height: 1s;
 }
 
-/* Main panel: inset past the orange stripes at top and bottom. */
-.panel {
+/* --- Header: wordmark, cabinet plate, model plate, badge ---------------- */
+
+.header {
+    position-type: self-directed;
+    left: 70px;
+    top: 72px;
+    width: 780px;
+    height: 44px;
+    col-between: 10px;
+}
+
+/*
+ * The wordmark is spaced out character by character in the markup rather than
+ * with a `letter-spacing` declaration, which vizia's stylesheet does not
+ * support.
+ */
+.wordmark {
+    width: auto;
+    height: 1s;
+    color: #101012;
+    font-size: 23;
+    font-weight: bold;
+    text-align: left;
+    child-top: 1s;
+    child-bottom: 1s;
+}
+
+.header-spacer {
     width: 1s;
     height: 1s;
-    child-top: 24px;
-    child-bottom: 22px;
-    child-left: 14px;
-    child-right: 14px;
-    col-between: 8px;
+    background-color: #00000000;
 }
 
-/* --- Brand block -------------------------------------------------------- */
-
-.brand {
-    width: 84px;
+.model-mark {
+    width: auto;
     height: 1s;
-    child-left: 1s;
-    child-right: 1s;
-    child-top: 12px;
-    row-between: 6px;
-}
-
-.jewel {
-    width: 46px;
-    height: 46px;
-}
-
-.brand-mark {
-    color: #2A241C;
-    font-size: 9;
-    font-weight: thin;
-}
-
-.brand-model {
-    color: #B44606;
+    color: #101012;
     font-size: 13.5;
     font-weight: light;
+    text-align: right;
+    child-top: 1s;
+    child-bottom: 1s;
 }
 
-/* --- Knob banks --------------------------------------------------------- */
+.crest {
+    width: 34px;
+    height: 42px;
+    top: 1s;
+    bottom: 1s;
+}
 
-.channel-group {
+/* --- Control bar -------------------------------------------------------- */
+
+/*
+ * The bar's background, its black outline and the three coloured cells are
+ * painted by `chassis::Faceplate`; these containers are transparent and only
+ * position the controls on top of them.
+ */
+.control-bar {
+    position-type: self-directed;
+    left: 64px;
+    top: 130px;
+    width: 792px;
+    height: 130px;
+}
+
+.cell {
     height: 1s;
-    width: auto;
+    background-color: #00000000;
+}
+
+.cell-switches {
+    width: 232px;
+    child-left: 8px;
+    child-right: 4px;
+    col-between: 4px;
+}
+
+.cell-clean {
+    width: 216px;
+    child-left: 3px;
+    child-right: 3px;
+    child-top: 4px;
+    child-bottom: 3px;
+}
+
+.cell-dirty {
+    width: 344px;
+    child-left: 3px;
+    child-right: 3px;
+    child-top: 4px;
+    child-bottom: 3px;
+}
+
+/* --- Switch cell -------------------------------------------------------- */
+
+.jewel {
+    width: 44px;
+    height: 44px;
+    top: 1s;
+    bottom: 1s;
+}
+
+.switch-grid {
+    width: 1s;
+    height: 1s;
+    child-top: 5px;
+    child-bottom: 5px;
     row-between: 2px;
 }
 
-.knob-row {
+.switch-row {
+    width: 1s;
     height: 1s;
-    width: auto;
     col-between: 2px;
+    child-left: 1s;
+    child-right: 1s;
 }
 
-.knob-cell {
-    width: 66px;
+.switch-cell {
+    width: 54px;
     height: 1s;
     child-left: 1s;
     child-right: 1s;
+}
+
+bat-switch {
+    width: 24px;
+    height: 1s;
+}
+
+lever-switch {
+    width: 24px;
+    height: 1s;
+}
+
+.switch-caption {
+    height: 11px;
+    width: 1s;
+    color: #1A1714;
+    font-size: 6;
+    font-weight: light;
+    text-align: center;
+}
+
+.switch-value {
+    height: 10px;
+    width: 1s;
+    color: #6B6152;
+    font-size: 5.25;
+    font-weight: light;
+    text-align: center;
+}
+
+/* --- Knob cells --------------------------------------------------------- */
+
+/*
+ * No stretch padding here. Vizia shares the free space between `child-left`,
+ * the child's own stretch `width` and `child-right`, so a `1s` on all three
+ * would give the knob a third of its cell; the knob is already `width: 1s` and
+ * draws itself centred.
+ */
+.knob-cell {
+    width: 1s;
+    height: 1s;
 }
 
 knob {
@@ -83,87 +197,196 @@ knob {
     height: 1s;
 }
 
+/*
+ * Printed on the orange cell, so the readout is dark rather than the grey it
+ * would be on the white panel.
+ */
 .value-readout {
-    height: 15px;
-    width: 1s;
-    color: #6B6152;
-    font-size: 8.25;
-    font-weight: light;
-    text-align: center;
-}
-
-.group-caption {
-    height: 14px;
-    width: 1s;
-    color: #8C7E68;
-    font-size: 7.5;
-    font-weight: light;
-    text-align: center;
-}
-
-.divider {
-    width: 1px;
-    height: 1s;
-    top: 10px;
-    bottom: 26px;
-    background-color: #C8BCA4;
-}
-
-/* --- Switch bank -------------------------------------------------------- */
-
-.switch-bank {
-    width: 198px;
-    height: 1s;
-    row-between: 6px;
-    child-top: 2px;
-    child-bottom: 8px;
-}
-
-.switch-row {
-    width: 1s;
-    height: 1s;
-    col-between: 4px;
-    child-left: 1s;
-    child-right: 1s;
-}
-
-.switch-cell {
-    width: 60px;
-    height: 1s;
-    child-left: 1s;
-    child-right: 1s;
-    row-between: 1px;
-}
-
-bat-switch {
-    width: 30px;
-    height: 1s;
-}
-
-lever-switch {
-    width: 30px;
-    height: 1s;
-}
-
-.switch-caption {
     height: 13px;
     width: 1s;
-    color: #2A241C;
-    font-size: 7.5;
-    font-weight: light;
-    text-align: center;
-}
-
-.switch-value {
-    height: 12px;
-    width: 1s;
-    color: #8C7E68;
+    color: #3A1D06;
     font-size: 6.75;
     font-weight: light;
     text-align: center;
 }
 
-/* Vizia's resize grip, tucked into the bottom-right stripe. */
+/* Vizia's resize grip, tucked into the bottom-right corner protector. */
 resize-handle {
-    color: #F2E9D6;
+    color: #6E747E;
+}
+
+/* --- Cabinet impulse response browser ----------------------------------- */
+
+/*
+ * The launcher sits in the header and names the cabinet in use. It is styled
+ * as a screen-printed plate rather than a control: it is chassis labelling,
+ * not something a host can automate.
+ */
+.cab-button {
+    width: 118px;
+    height: 20px;
+    top: 1s;
+    bottom: 1s;
+    border-width: 1px;
+    border-color: #1A1714;
+    border-radius: 2px;
+    background-color: #E8620E;
+    child-left: 1s;
+    child-right: 1s;
+    child-top: 1s;
+    child-bottom: 1s;
+}
+
+.cab-button:hover {
+    background-color: #F0821E;
+    border-color: #101012;
+}
+
+.cab-button label {
+    color: #101012;
+    font-size: 6.75;
+    font-weight: light;
+    text-align: center;
+}
+
+/*
+ * Swallows clicks aimed at the controls behind the panel, and dims them.
+ *
+ * `position-type` is set here rather than relying on vizia's `zstack > *` rule:
+ * the overlay is built inside a `Binding`, whose entity is ignored by the
+ * layout tree, so the stylesheet should not have to assume how the selector
+ * treats that.
+ */
+.ir-scrim {
+    position-type: self-directed;
+    width: 1s;
+    height: 1s;
+    background-color: #14141688;
+}
+
+.ir-browser {
+    position-type: self-directed;
+    width: 640px;
+    height: 268px;
+    left: 1s;
+    right: 1s;
+    top: 1s;
+    bottom: 1s;
+    background-color: #F9F7F2;
+    border-width: 2px;
+    border-color: #B44606;
+    border-radius: 3px;
+    child-left: 12px;
+    child-right: 12px;
+    child-top: 10px;
+    child-bottom: 10px;
+    row-between: 6px;
+}
+
+.ir-title {
+    width: 1s;
+    height: 14px;
+    color: #B44606;
+    font-size: 9;
+    font-weight: light;
+}
+
+.ir-path {
+    width: 1s;
+    height: 13px;
+    color: #6B6152;
+    font-size: 7.5;
+    font-weight: light;
+}
+
+.ir-toolbar {
+    width: 1s;
+    height: 22px;
+    col-between: 6px;
+}
+
+.ir-action {
+    width: 120px;
+    height: 1s;
+    border-width: 1px;
+    border-color: #B0A48C;
+    border-radius: 2px;
+    background-color: #E3D8C0;
+    child-left: 1s;
+    child-right: 1s;
+    child-top: 1s;
+    child-bottom: 1s;
+}
+
+.ir-action:hover {
+    background-color: #F6F4EF;
+    border-color: #B44606;
+}
+
+.ir-action label {
+    color: #1A1714;
+    font-size: 7.5;
+    font-weight: light;
+    text-align: center;
+}
+
+.ir-list {
+    width: 1s;
+    height: 1s;
+    background-color: #E3D8C0;
+    border-width: 1px;
+    border-color: #C8BCA4;
+    border-radius: 2px;
+}
+
+.ir-rows {
+    width: 1s;
+    height: auto;
+    child-left: 4px;
+    child-right: 4px;
+    child-top: 3px;
+    child-bottom: 3px;
+    row-between: 1px;
+}
+
+/*
+ * Rows are buttons rather than labels so they are keyboard-navigable: vizia
+ * gives `Button` a focus role, which a bare label would not have.
+ */
+.ir-folder,
+.ir-file {
+    width: 1s;
+    height: 17px;
+    background-color: #00000000;
+    border-width: 0px;
+    border-radius: 0px;
+    child-left: 6px;
+    child-right: 1s;
+    child-top: 1s;
+    child-bottom: 1s;
+}
+
+.ir-folder:hover,
+.ir-file:hover {
+    background-color: #E8620E33;
+}
+
+.ir-folder label {
+    color: #B44606;
+    font-size: 7.5;
+    font-weight: light;
+}
+
+.ir-file label {
+    color: #1A1714;
+    font-size: 7.5;
+    font-weight: light;
+}
+
+.ir-status {
+    width: 1s;
+    height: 14px;
+    color: #6B6152;
+    font-size: 7.5;
+    font-weight: light;
 }

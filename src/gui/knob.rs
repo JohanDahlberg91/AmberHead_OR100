@@ -32,6 +32,15 @@ const SWEEP: f32 = 1.5 * std::f32::consts::PI;
 const FLUTE_COUNT: usize = 20;
 /// Number of engraved index ticks around each knob.
 const TICK_COUNT: usize = 11;
+/// Radius of the knob cap as a fraction of the space its cell allows.
+///
+/// The cap has to dominate its cell the way a real amplifier's does, while
+/// leaving room for the index ring outside it: `CAP_RADIUS * TICK_OUTER` is
+/// what actually has to fit, and at 0.80 x 1.18 that is 0.944 of the half-cell.
+const CAP_RADIUS: f32 = 0.80;
+/// Inner and outer ends of an index tick, as multiples of the cap radius.
+const TICK_INNER: f32 = 1.06;
+const TICK_OUTER: f32 = 1.18;
 
 /// Converts a travel fraction into a pointer angle measured clockwise from
 /// straight up, so `0.0` points down-left and `1.0` points down-right.
@@ -240,7 +249,7 @@ where
 
         // Reserve the top of the cell for the pictogram and centre the knob in
         // what remains, so every cell in the bank lines up regardless of glyph.
-        let glyph_size = (bounds.h * 0.20).min(bounds.w * 0.34);
+        let glyph_size = (bounds.h * 0.24).min(bounds.w * 0.40);
         glyphs::draw(
             canvas,
             self.glyph,
@@ -250,9 +259,9 @@ where
             theme::with_opacity(theme::PANEL_INK, opacity),
         );
 
-        let dial_top = bounds.y + glyph_size * 1.35;
-        let dial_height = bounds.h - (glyph_size * 1.35);
-        let radius = (dial_height.min(bounds.w) * 0.5) * 0.72;
+        let dial_top = bounds.y + glyph_size * 1.25;
+        let dial_height = bounds.h - (glyph_size * 1.25);
+        let radius = (dial_height.min(bounds.w) * 0.5) * CAP_RADIUS;
         let centre_x = bounds.x + bounds.w * 0.5;
         let centre_y = dial_top + dial_height * 0.5 - radius * 0.10;
 
@@ -272,8 +281,8 @@ fn draw_index_ticks(
     fraction: f32,
     opacity: f32,
 ) {
-    let inner = radius * 1.18;
-    let outer = radius * 1.34;
+    let inner = radius * TICK_INNER;
+    let outer = radius * TICK_OUTER;
     for index in 0..TICK_COUNT {
         let tick_fraction = index as f32 / (TICK_COUNT - 1) as f32;
         let angle = angle_for(tick_fraction);
@@ -293,7 +302,7 @@ fn draw_index_ticks(
             theme::with_opacity(theme::PANEL_ENGRAVE, opacity)
         };
         let mut paint = vg::Paint::color(colour);
-        paint.set_line_width((radius * 0.09).max(1.0));
+        paint.set_line_width((radius * 0.10).max(1.0));
         paint.set_line_cap(vg::LineCap::Round);
         canvas.stroke_path(&path, &paint);
     }
@@ -417,6 +426,54 @@ mod tests {
             let angle = angle_for(step as f32 / 100.0);
             assert!(angle > previous, "rotation reversed at step {step}");
             previous = angle;
+        }
+    }
+
+    /// Reimplements the sizing arithmetic in [`View::draw`] for a cell of the
+    /// given size, returning the pictogram's height, the dial centre and the
+    /// outer radius of the index ring.
+    fn drawn_geometry(width: f32, height: f32) -> (f32, f32, f32) {
+        let glyph_size = (height * 0.24).min(width * 0.40);
+        let dial_top = glyph_size * 1.25;
+        let dial_height = height - dial_top;
+        let radius = (dial_height.min(width) * 0.5) * CAP_RADIUS;
+        let centre_y = dial_top + dial_height * 0.5 - radius * 0.10;
+        (glyph_size, centre_y, radius * TICK_OUTER)
+    }
+
+    #[test]
+    fn the_cap_and_its_index_ring_fit_every_cell_the_faceplate_produces() {
+        // The dirty channel's five knobs give the narrowest cell and the clean
+        // channel's three the widest, at the 75 % and 200 % ends of the scale
+        // range specification section 4 requires. A ring that overflowed would
+        // be clipped against the neighbouring knob or the cell's black border.
+        for (name, width, height) in [
+            ("dirty at 100 %", 68.8f32, 110.0f32),
+            ("clean at 100 %", 70.0, 110.0),
+            ("dirty at 75 %", 51.6, 82.5),
+            ("clean at 200 %", 140.0, 220.0),
+        ] {
+            let (glyph, centre_y, outer) = drawn_geometry(width, height);
+            assert!(
+                outer * 2.0 <= width,
+                "{name}: the ring is {} wide in a {width} cell",
+                outer * 2.0
+            );
+            assert!(
+                centre_y - outer >= glyph,
+                "{name}: the ring runs into the pictogram"
+            );
+            assert!(
+                centre_y + outer <= height,
+                "{name}: the ring runs off the bottom of the cell"
+            );
+            // ...and the cap still dominates its cell, rather than being lost
+            // in the middle of it.
+            assert!(
+                outer * 2.0 > width * 0.85,
+                "{name}: the knob fills only {} of its cell",
+                outer * 2.0 / width
+            );
         }
     }
 

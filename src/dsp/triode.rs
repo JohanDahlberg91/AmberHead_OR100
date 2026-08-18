@@ -62,23 +62,69 @@ pub struct KorenModel {
     pub kvb: f64,
     /// Exponent `Ex` of the three-halves-power law.
     pub ex: f64,
-    /// Current scaling term.
+    /// Current scaling term `Kg1`.
     ///
     /// Specification section 2.A writes the denominator of `Ip` as `K_p` and
     /// lists `K_p = 600`. In Koren's published formulation the exponential
     /// knee term and the current scaling term are two distinct constants —
     /// `Kp` and `Kg1` — and the 12AX7 value for the scaling term is 1060.
-    /// Using 1060 here is what makes the model reproduce the datasheet plate
-    /// curves: at `Vgk = 0 V, Vpk = 100 V` it yields 0.75 mA, matching the
-    /// published 12AX7 characteristic. Using 600 would inflate every plate
-    /// current by a factor of 1.77 and push the quiescent point off the
-    /// datasheet curves entirely.
+    /// Using 600 in the denominator would inflate every plate current by a
+    /// factor of 1.77 and push the quiescent point off the datasheet curves
+    /// entirely. See [`KorenModel::default`] for the measured verification.
     pub kg1: f64,
-    /// Grid contact-potential offset `Voff`, -0.5 V for the 12AX7.
+    /// Grid contact-potential offset `Voff`, in volts, added to `Vgk`.
+    ///
+    /// Zero for the 12AX7: see [`KorenModel::default`]. The term is retained
+    /// because Koren's general form admits it and other tube types are fitted
+    /// with a non-zero value, but for a device whose parameters were fitted
+    /// against *measured* plate curves the contact potential is already baked
+    /// into the fit, and adding it again double-counts it.
     pub v_off: f64,
 }
 
 impl Default for KorenModel {
+    /// Koren's published 12AX7 / ECC83 parameter set.
+    ///
+    /// # Verification against the RCA 12AX7 datasheet
+    ///
+    /// The datasheet gives two characteristic operating points. Evaluating
+    /// this parameter set at both, and differentiating the model numerically
+    /// for `gm = dIp/dVgk` and `rp = dVpk/dIp`:
+    ///
+    /// | Point | Quantity | Datasheet | Model | Error |
+    /// | :--- | :--- | ---: | ---: | ---: |
+    /// | `Vpk = 250 V, Vgk = -2 V` | `Ip` | 1.20 mA | 0.95 mA | -21 % |
+    /// | | `gm` | 1600 µS | 1670 µS | +4 % |
+    /// | | `rp` | 62.5 kΩ | 53.7 kΩ | -14 % |
+    /// | | `mu` | 100 | 90 | -10 % |
+    /// | `Vpk = 100 V, Vgk = -1 V` | `Ip` | 0.50 mA | 0.10 mA | -80 % |
+    ///
+    /// The 250 V point — the one a preamp triode actually operates near — is
+    /// reproduced to within the spread between individual tubes. The 100 V
+    /// point is the known weakness of the Koren form: it under-predicts badly
+    /// at low plate voltage and low current, near cutoff. That region is
+    /// where the stage is already clipping into cutoff, so the error moves the
+    /// exact shape of the cutoff knee rather than the operating point or the
+    /// gain.
+    ///
+    /// # Why `v_off` is zero
+    ///
+    /// An earlier revision carried `v_off = -0.5 V`, on the reasoning that a
+    /// real triode has a contact potential of roughly half a volt. Evaluated
+    /// against the datasheet that offset is simply wrong, because Koren's
+    /// constants were fitted to measured curves that already contain the
+    /// contact potential:
+    ///
+    /// | `Voff` | `Ip` at 250 V / -2 V | `gm` there | Stage `Ia` | Stage `Va` |
+    /// | ---: | ---: | ---: | ---: | ---: |
+    /// | 0.0 V | 0.95 mA | 1670 µS | 0.98 mA | 202 V |
+    /// | -0.5 V | 0.34 mA | 811 µS | 0.82 mA | 218 V |
+    /// | +0.5 V | 1.99 mA | 2455 µS | — | — |
+    ///
+    /// against a datasheet 1.20 mA / 1600 µS, and against the 100 kΩ / 1.5 kΩ
+    /// / 300 V preamp stage that a real Orange or Marshall front end measures
+    /// at roughly 1 mA and 200 V on the plate. Zero is the only value of the
+    /// three that lands on both.
     fn default() -> Self {
         Self {
             mu: 100.0,
@@ -86,7 +132,7 @@ impl Default for KorenModel {
             kvb: 300.0,
             ex: 1.4,
             kg1: 1060.0,
-            v_off: -0.5,
+            v_off: 0.0,
         }
     }
 }
@@ -421,34 +467,110 @@ mod tests {
         stage
     }
 
+    /// Numerical transconductance `gm = dIp/dVgk` at an operating point, in
+    /// siemens.
+    fn transconductance(model: &KorenModel, vgk: f64, vpk: f64) -> f64 {
+        let h = 1.0e-4;
+        (model.plate_current(vgk + h, vpk) - model.plate_current(vgk - h, vpk)) / (2.0 * h)
+    }
+
+    /// Numerical plate resistance `rp = dVpk/dIp` at an operating point, in
+    /// ohms.
+    fn plate_resistance(model: &KorenModel, vgk: f64, vpk: f64) -> f64 {
+        let h = 1.0e-2;
+        (2.0 * h) / (model.plate_current(vgk, vpk + h) - model.plate_current(vgk, vpk - h))
+    }
+
     #[test]
-    fn koren_current_matches_the_12ax7_datasheet() {
+    fn koren_current_matches_the_12ax7_datasheet_at_the_preamp_operating_point() {
         let model = KorenModel::default();
-        // Published 12AX7 plate characteristic: ~0.75 mA at Vg = 0, Vp = 100 V.
-        let current = model.plate_current(0.0, 100.0);
+        // RCA 12AX7 published characteristic: Vp = 250 V, Vg = -2 V gives
+        // Ip = 1.2 mA, gm = 1600 uS, rp = 62.5 kOhm, mu = 100. This is the
+        // point a preamp triode actually sits near, so it is the point the
+        // model has to reproduce. See `KorenModel::default` for the measured
+        // comparison table and for why the low-plate-voltage point is not
+        // asserted here.
+        let current = model.plate_current(-2.0, 250.0);
         assert!(
-            (current - 0.75e-3).abs() < 0.1e-3,
-            "Ip was {} mA",
+            (0.85e-3..=1.35e-3).contains(&current),
+            "Ip at 250 V / -2 V was {} mA, datasheet 1.20 mA",
             current * 1e3
         );
+
+        let gm = transconductance(&model, -2.0, 250.0);
+        assert!(
+            (1.30e-3..=1.90e-3).contains(&gm),
+            "gm was {} uS, datasheet 1600 uS",
+            gm * 1e6
+        );
+
+        let rp = plate_resistance(&model, -2.0, 250.0);
+        assert!(
+            (48.0e3..=72.0e3).contains(&rp),
+            "rp was {} kOhm, datasheet 62.5 kOhm",
+            rp / 1e3
+        );
+
+        // mu = gm * rp must recover the 12AX7's defining figure of merit.
+        let mu = gm * rp;
+        assert!((85.0..=110.0).contains(&mu), "mu came out at {mu}");
+    }
+
+    #[test]
+    fn koren_model_carries_no_contact_potential_offset() {
+        // Regression guard. `v_off` was once -0.5 V, which cut the plate
+        // current at the datasheet operating point from 0.95 mA to 0.34 mA
+        // against a published 1.20 mA, and halved the transconductance. The
+        // 12AX7 constants are fitted to measured curves, which already contain
+        // the contact potential.
+        let model = KorenModel::default();
+        assert_eq!(model.v_off, 0.0);
+
+        let shifted = KorenModel {
+            v_off: -0.5,
+            ..KorenModel::default()
+        };
+        let reference = 1.20e-3;
+        let error_of = |m: &KorenModel| (m.plate_current(-2.0, 250.0) - reference).abs();
+        assert!(
+            error_of(&model) < error_of(&shifted),
+            "the offset model tracked the datasheet better, which cannot be right"
+        );
+    }
+
+    #[test]
+    fn koren_current_is_cut_off_and_monotonic() {
+        let model = KorenModel::default();
         // Cut off hard at a deeply negative grid.
         assert!(model.plate_current(-20.0, 250.0) < 1.0e-9);
         // Monotonic in both arguments.
         assert!(model.plate_current(-1.0, 250.0) > model.plate_current(-2.0, 250.0));
         assert!(model.plate_current(-1.0, 250.0) > model.plate_current(-1.0, 150.0));
+        // A tube cannot conduct with no plate voltage.
+        assert_eq!(model.plate_current(0.0, 0.0), 0.0);
+        assert_eq!(model.plate_current(0.0, -10.0), 0.0);
     }
 
     #[test]
-    fn quiescent_point_lands_in_a_plausible_class_a_window() {
+    fn quiescent_point_matches_a_measured_preamp_stage() {
         let stage = prepared_stage(StageCircuit::classic_gain_stage());
         let bias = stage.quiescent_bias();
         let plate = stage.quiescent_plate();
-        // A 1.5 kΩ-biased 12AX7 off 300 V sits around -1.3 V grid / 170..230 V
-        // plate. Anything outside that is a broken solver, not a design choice.
-        assert!((-2.5..=-0.7).contains(&bias), "bias solved to {bias} V");
+        let current =
+            (300.0 - plate) / StageCircuit::classic_gain_stage().plate_resistor as f32 * 1.0e3;
+
+        // A 100 kOhm / 1.5 kOhm / 300 V stage — the front end of every
+        // Orange and Marshall preamp — measures around 1 mA of plate current,
+        // 200 V on the plate and 1.4 V on the cathode. The model lands at
+        // 0.98 mA / 202.4 V / 1.46 V.
+        assert!((-1.7..=-1.2).contains(&bias), "bias solved to {bias} V");
         assert!(
-            (150.0..=250.0).contains(&plate),
+            (190.0..=215.0).contains(&plate),
             "plate solved to {plate} V"
+        );
+        assert!(
+            (0.85..=1.15).contains(&current),
+            "plate current solved to {current} mA"
         );
     }
 
@@ -482,7 +604,11 @@ mod tests {
     #[test]
     fn impulse_response_is_bounded_and_settles_to_dc_zero() {
         let mut stage = prepared_stage(StageCircuit::classic_gain_stage());
-        let first = stage.process(1.0);
+        // 0.1 V sits comfortably inside the stage's 1.46 V bias window, so
+        // this measures the impulse response of the amplifier rather than the
+        // response of `sanitize`'s clamp. Behaviour under absurd input is
+        // covered by `output_stays_finite_under_absurd_input`.
+        let first = stage.process(0.1);
         assert!(first.is_finite());
         let mut peak = first.abs();
         let mut last = first;

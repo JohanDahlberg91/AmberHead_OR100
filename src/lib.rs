@@ -7,7 +7,9 @@
 //!   code that runs on the audio thread.
 //! * [`params`] — the fourteen-parameter schema from specification section 3.
 //! * [`gui`] — the `vizia` faceplate. Never references [`dsp`] types.
-//! * [`shared`] — the one lock-free value that crosses the audio/UI boundary.
+//! * [`ir`] — WAV decoding for the cabinet impulse response loader. Editor
+//!   thread and `initialize()` only; never touched during `process()`.
+//! * [`shared`] — the lock-free values that cross the audio/UI boundary.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -17,13 +19,15 @@ use nih_plug::prelude::*;
 
 pub mod dsp;
 pub mod gui;
+pub mod ir;
 pub mod params;
 pub mod shared;
 
+use dsp::cabinet::IR_LENGTH;
 use dsp::denormal::DenormalGuard;
 use dsp::engine::{AmpEngine, SampleControls};
 use params::Or100Params;
-use shared::AtomicLevel;
+use shared::{AtomicLevel, IrSlot};
 
 /// The plugin.
 pub struct AmberHeadOr100 {
@@ -32,6 +36,16 @@ pub struct AmberHeadOr100 {
     engine: Box<AmpEngine>,
     /// Jewel lamp brightness, published for the editor.
     lamp: Arc<AtomicLevel>,
+    /// Host sample rate, published for the editor so it can resample a loaded
+    /// impulse response to the rate the convolver is running at.
+    sample_rate: Arc<AtomicLevel>,
+    /// Impulse responses on their way from the editor to the audio thread.
+    ir_slot: Arc<IrSlot>,
+    /// Last generation of `ir_slot` the audio thread consumed.
+    ir_generation: u32,
+    /// Landing buffer for a collected response. Allocated in
+    /// [`Plugin::initialize`] so the audio thread never has to.
+    ir_scratch: Vec<f32>,
     /// Reusable control snapshot. Held as plugin state so the per-sample loop
     /// never constructs one on the audio thread.
     controls: SampleControls,
@@ -47,6 +61,10 @@ impl Default for AmberHeadOr100 {
             // lines; boxing keeps `Plugin` itself small enough to move cheaply.
             engine: Box::new(AmpEngine::new()),
             lamp: Arc::new(AtomicLevel::new(0.0)),
+            sample_rate: Arc::new(AtomicLevel::new(0.0)),
+            ir_slot: Arc::new(IrSlot::new(IR_LENGTH)),
+            ir_generation: 0,
+            ir_scratch: Vec::new(),
             controls,
         }
     }
@@ -95,6 +113,8 @@ impl Plugin for AmberHeadOr100 {
         gui::create(
             self.params.clone(),
             self.lamp.clone(),
+            self.sample_rate.clone(),
+            self.ir_slot.clone(),
             self.params.editor_state.clone(),
         )
     }
@@ -124,6 +144,16 @@ impl Plugin for AmberHeadOr100 {
         context.set_latency_samples(self.engine.latency_samples());
         self.lamp
             .store(self.engine.lamp_brightness(self.controls.power));
+
+        // The editor needs the rate in order to resample a loaded response,
+        // and it has no other way to learn it.
+        self.sample_rate.store(buffer_config.sample_rate);
+        self.ir_scratch = vec![0.0; IR_LENGTH];
+        // Nothing published so far belongs to this instance; the response the
+        // engine is about to load comes from the persisted path below.
+        self.ir_generation = self.ir_slot.current_generation();
+        self.restore_persisted_impulse_response(buffer_config.sample_rate);
+
         true
     }
 
@@ -140,6 +170,11 @@ impl Plugin for AmberHeadOr100 {
         // Flush-to-zero and denormals-are-zero for the whole callback, restored
         // on drop so the host's FPU state is left exactly as it was found.
         let _denormals = DenormalGuard::new();
+
+        // A cabinet the editor loaded lands here, once per block at most. The
+        // collect-and-load path touches only buffers that already exist, so it
+        // allocates nothing and takes no lock (`CLAUDE.md` §1).
+        self.collect_pending_impulse_response();
 
         // Discrete switch positions are read once per block; only the eight
         // continuous controls are sampled per frame.
@@ -177,6 +212,59 @@ impl Plugin for AmberHeadOr100 {
 
         self.controls = controls;
         ProcessStatus::Normal
+    }
+}
+
+impl AmberHeadOr100 {
+    /// Reloads the impulse response named by the persisted `ir_path`.
+    ///
+    /// Called from `initialize`, on the main thread, where blocking file I/O is
+    /// allowed. A path that no longer resolves — a project opened on another
+    /// machine, a sample library that moved — logs the reason and leaves the
+    /// built-in cabinet in place, which is the only recovery that keeps the
+    /// session audible.
+    fn restore_persisted_impulse_response(&mut self, sample_rate: f32) {
+        let Ok(path) = self.params.ir_path.read() else {
+            nih_error!("The impulse response path lock is poisoned; using the built-in cabinet");
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+
+        match ir::load_impulse_response(std::path::Path::new(path.as_str()), sample_rate as f64) {
+            Ok(loaded) => {
+                if !self.engine.load_impulse_response(&loaded.taps) {
+                    nih_error!("The cabinet rejected the impulse response at '{path}'");
+                }
+            }
+            Err(error) => nih_error!("Cannot load the impulse response at '{path}': {error}"),
+        }
+    }
+
+    /// Applies an impulse response the editor published, if there is one.
+    ///
+    /// Wait-free and allocation-free. A zero-length payload is the editor's
+    /// request to go back to the built-in cabinet.
+    #[inline]
+    fn collect_pending_impulse_response(&mut self) {
+        // Split the borrow: the scratch buffer and the engine are both fields.
+        let Self {
+            ir_slot,
+            ir_generation,
+            ir_scratch,
+            engine,
+            ..
+        } = self;
+        let Some(length) = ir_slot.collect(ir_generation, ir_scratch) else {
+            return;
+        };
+
+        if length == 0 {
+            engine.restore_default_impulse_response();
+        } else if let Some(taps) = ir_scratch.get(..length) {
+            engine.load_impulse_response(taps);
+        }
     }
 }
 

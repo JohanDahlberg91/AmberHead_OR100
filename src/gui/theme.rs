@@ -1,8 +1,10 @@
 //! Faceplate palette.
 //!
-//! Specification section 4: "Textured cream/ivory enamel panel with top and
-//! bottom Orange-stripe framing", "fluted black pointer knobs with white
-//! indicator lines", "Dynamic amber pilot light".
+//! Specification section 4: "fluted black pointer knobs with white indicator
+//! lines", "Dynamic amber pilot light", drawn on the amplifier the plugin
+//! models — an orange vinyl-covered box with black corner protectors, a
+//! chrome-framed aperture and a white control panel carrying a black-outlined
+//! bar of coloured cells.
 //!
 //! Every colour the custom-drawn widgets use lives here so the whole faceplate
 //! can be revoiced from one place, and so the CSS-styled containers and the
@@ -20,18 +22,39 @@ const fn rgb(red: u8, green: u8, blue: u8) -> vg::Color {
     }
 }
 
-/// Orange stripe framing the top and bottom of the chassis.
+/// The amplifier's signature orange, used for the control-bar cells.
 pub const ORANGE: vg::Color = rgb(0xE8, 0x62, 0x0E);
-/// Deeper orange used for the stripe's inner shadow line.
+/// Deeper orange for shadowed orange surfaces and printed accents.
 pub const ORANGE_DEEP: vg::Color = rgb(0xB4, 0x46, 0x06);
-/// Cream enamel of the main panel.
-pub const IVORY: vg::Color = rgb(0xF2, 0xE9, 0xD6);
-/// Slightly darker cream used for the panel's texture speckle.
-pub const IVORY_SHADE: vg::Color = rgb(0xE3, 0xD8, 0xC0);
+/// Fill of the two orange control-bar cells.
+pub const BAND_ORANGE: vg::Color = ORANGE;
+
+/// Vinyl covering where the light falls, at the top of the box.
+pub const TOLEX_LIT: vg::Color = rgb(0xF0, 0x6E, 0x14);
+/// The same vinyl in shadow, at the bottom.
+pub const TOLEX_SHADE: vg::Color = rgb(0xCE, 0x55, 0x08);
+/// Dark half of the pebbled grain in the vinyl.
+pub const TOLEX_GRAIN: vg::Color = rgb(0x8A, 0x38, 0x04);
+/// Shadow along the box's edges and in the panel recess.
+pub const TOLEX_EDGE: vg::Color = rgb(0x6E, 0x2C, 0x03);
+
+/// Moulded plastic of the corner protectors.
+pub const CORNER_BODY: vg::Color = rgb(0x18, 0x18, 0x1A);
+/// Sheen along the lit face of a corner protector.
+pub const CORNER_LIT: vg::Color = rgb(0x4A, 0x4A, 0x50);
+/// Outline where a corner protector meets the vinyl.
+pub const CORNER_EDGE: vg::Color = rgb(0x0A, 0x0A, 0x0C);
+
+/// The control panel's white face.
+pub const PANEL_WHITE: vg::Color = rgb(0xF9, 0xF7, 0xF2);
+/// The same face where it falls into shadow at the bottom of the panel.
+pub const PANEL_SHADE: vg::Color = rgb(0xE4, 0xE1, 0xD9);
+/// The heavy black outline around the control bar and between its cells.
+pub const BAR_INK: vg::Color = rgb(0x10, 0x10, 0x12);
 /// Screen-printed ink: glyphs and engraved detail.
-pub const PANEL_INK: vg::Color = rgb(0x2A, 0x24, 0x1C);
+pub const PANEL_INK: vg::Color = rgb(0x1A, 0x17, 0x14);
 /// Unlit engraved index marks.
-pub const PANEL_ENGRAVE: vg::Color = rgb(0xB0, 0xA4, 0x8C);
+pub const PANEL_ENGRAVE: vg::Color = rgb(0x8C, 0x84, 0x74);
 
 /// Main body of the moulded knob cap.
 pub const KNOB_BODY: vg::Color = rgb(0x14, 0x14, 0x16);
@@ -125,7 +148,15 @@ mod tests {
 
     #[test]
     fn the_orange_family_is_actually_orange() {
-        for (name, colour) in [("stripe", ORANGE), ("deep", ORANGE_DEEP), ("amber", AMBER)] {
+        for (name, colour) in [
+            ("band", ORANGE),
+            ("deep", ORANGE_DEEP),
+            ("amber", AMBER),
+            ("tolex lit", TOLEX_LIT),
+            ("tolex shade", TOLEX_SHADE),
+            ("tolex grain", TOLEX_GRAIN),
+            ("tolex edge", TOLEX_EDGE),
+        ] {
             assert!(
                 colour.r > colour.g && colour.g > colour.b,
                 "{name} is not an orange hue"
@@ -134,30 +165,77 @@ mod tests {
     }
 
     #[test]
-    fn the_enamel_is_a_warm_near_white() {
-        for (name, colour) in [("ivory", IVORY), ("shade", IVORY_SHADE)] {
-            assert!(luminance(colour) > 0.8, "{name} is too dark for enamel");
+    fn the_vinyl_is_lit_from_above() {
+        // The box is drawn with a top-to-bottom gradient, so the lit shade has
+        // to be the brighter one or the light appears to come from the floor.
+        assert!(
+            luminance(TOLEX_LIT) > luminance(TOLEX_SHADE),
+            "the tolex gradient is upside down"
+        );
+        // Both grain colours have to be visible against the vinyl without
+        // turning it into a different material.
+        let grain = luminance(TOLEX_SHADE) - luminance(TOLEX_GRAIN);
+        assert!((0.03..0.35).contains(&grain), "grain contrast is {grain}");
+        assert!(
+            luminance(TOLEX_EDGE) < luminance(TOLEX_SHADE),
+            "the edge shadow is lighter than the surface it shades"
+        );
+    }
+
+    #[test]
+    fn the_panel_is_a_warm_near_white() {
+        for (name, colour) in [("panel", PANEL_WHITE), ("shade", PANEL_SHADE)] {
+            assert!(luminance(colour) > 0.8, "{name} is too dark for the panel");
             assert!(colour.r >= colour.g, "{name} is not warm");
             assert!(colour.g >= colour.b, "{name} is not warm");
         }
+        assert!(
+            luminance(PANEL_WHITE) > luminance(PANEL_SHADE),
+            "the panel gradient is upside down"
+        );
+        // The panel has to read as a lighter material than the vinyl it is
+        // set into, which is the whole point of the aperture.
+        assert!(luminance(PANEL_WHITE) > luminance(TOLEX_LIT) + 0.3);
+    }
+
+    #[test]
+    fn the_corner_protectors_read_as_black_plastic() {
+        assert!(luminance(CORNER_BODY) < 0.15, "the corners are not dark");
+        assert!(
+            luminance(CORNER_LIT) > luminance(CORNER_BODY),
+            "the corner protectors have no highlight"
+        );
+        assert!(
+            luminance(CORNER_EDGE) < luminance(CORNER_BODY),
+            "the corner outline does not read against the moulding"
+        );
     }
 
     #[test]
     fn every_marking_contrasts_with_the_surface_it_sits_on() {
-        // Screen-printed ink and engraved marks against the enamel panel.
+        // Screen-printed ink and engraved marks against the white panel.
         for (name, ink) in [("ink", PANEL_INK), ("engrave", PANEL_ENGRAVE)] {
-            let contrast = luminance(IVORY) - luminance(ink);
+            let contrast = luminance(PANEL_WHITE) - luminance(ink);
             assert!(
                 contrast > 0.15,
                 "{name} is illegible on the panel: {contrast}"
             );
         }
+        // Glyphs are printed on the orange cells too, so they have to survive
+        // that background as well as the white one.
+        let on_orange = luminance(BAND_ORANGE) - luminance(PANEL_INK);
+        assert!(on_orange > 0.15, "ink is illegible on orange: {on_orange}");
+        // The bar outline against both of the surfaces it separates.
+        for (name, surface) in [("panel", PANEL_WHITE), ("band", BAND_ORANGE)] {
+            let contrast = luminance(surface) - luminance(BAR_INK);
+            assert!(contrast > 0.2, "the bar outline vanishes on {name}");
+        }
         // The white pointer against the black knob cap.
         let pointer = luminance(KNOB_POINTER) - luminance(KNOB_BODY);
         assert!(pointer > 0.8, "pointer is invisible on the cap: {pointer}");
-        // The knob cap against the panel it is mounted on.
-        let cap = luminance(IVORY) - luminance(KNOB_BODY);
-        assert!(cap > 0.7, "knob cap does not stand out: {cap}");
+        // The knob cap against the orange cell it is mounted on.
+        let cap = luminance(BAND_ORANGE) - luminance(KNOB_BODY);
+        assert!(cap > 0.3, "knob cap does not stand out: {cap}");
     }
 
     #[test]
