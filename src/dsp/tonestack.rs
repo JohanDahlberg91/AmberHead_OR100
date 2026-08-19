@@ -65,7 +65,7 @@
 //! Trapezoidal integration is the bilinear transform, so the discrete network
 //! is the bilinear image of the analog one.
 
-use super::denormal::{flush, sanitize};
+use super::denormal::{flush, sanitize_volts};
 
 /// Number of unknown nodes: A, B, C, D, E, OUT.
 const NODES: usize = 6;
@@ -117,9 +117,28 @@ pub struct ToneStackCircuit {
 impl ToneStackCircuit {
     /// Dirty-channel 3-band stack.
     ///
-    /// Marshall/Orange values: 33 kΩ slope resistor, 220 kΩ treble, 1 MΩ bass,
-    /// 25 kΩ mid, 470 pF treble cap and 22 nF bass/mid caps, loaded by the
-    /// 1 MΩ dirty volume pot.
+    /// These values are **not** the factory schematic's, and the reason is
+    /// worth recording. The original OR100 has one two-band network — 100 kΩ
+    /// slope resistor, two 1 MΩ linear pots, 330 pF / 22 nF / 2.2 nF and a
+    /// fixed 27 kΩ to ground — reproduced exactly in
+    /// [`Self::or100_clean`]. The modern reissue's dirty channel has a
+    /// `Middle` control, and that network cannot host one: measured in this
+    /// topology, a 100 kΩ slope resistor leaves the mid element with **0.1 to
+    /// 0.8 dB** of authority across its whole travel whatever pot is fitted to
+    /// it, because so little of the signal reaches node `B` for the mid branch
+    /// to work on. Bass and treble were fine; `Middle` was a dead knob.
+    ///
+    /// So the three-band channel keeps a 33 kΩ slope resistor, which restores
+    /// the mid control to a useful 9.9 dB of range, at the cost of a deeper
+    /// insertion loss (-9.3 dB against -6.4 dB at 800 Hz). Substituting the
+    /// factory's parts one at a time was measured and rejected:
+    ///
+    /// | Stack | Loss @ 800 Hz | Treble | Bass | Mid |
+    /// | :--- | ---: | ---: | ---: | ---: |
+    /// | Factory values, 50 kΩ mid | -6.4 dB | 11.9 dB | 7.5 dB | **0.8 dB** |
+    /// | Factory values, 25 kΩ mid | -6.6 dB | 14.4 dB | 10.7 dB | **0.4 dB** |
+    /// | Factory slope, 220 kΩ treble | -6.6 dB | 11.4 dB | 13.0 dB | **0.1 dB** |
+    /// | These values | -9.3 dB | 9.8 dB | 7.5 dB | 9.9 dB |
     pub const fn or100_dirty() -> Self {
         Self {
             slope_resistor: 33_000.0,
@@ -133,24 +152,22 @@ impl ToneStackCircuit {
         }
     }
 
-    /// Clean-channel 2-band stack.
+    /// Clean-channel 2-band stack: the factory network exactly as drawn.
     ///
-    /// The clean channel has no `Middle` control, so the mid element is a fixed
-    /// resistor — see [`ToneStack::CLEAN_FIXED_MID`]. The larger 56 kΩ slope
-    /// resistor and 250 pF treble cap give the softer, less scooped clean
-    /// voicing. The remaining bass/treble interaction is unchanged, which is
-    /// why raising `Bass` still broadens the midrange scoop exactly as
-    /// specification section 2.B describes.
+    /// 100 kΩ slope resistor, 1 MΩ linear `Treble` and `Bass`, 330 pF treble
+    /// cap, 22 nF bass cap, 2.2 nF from the slope node, and the 27 kΩ fixed
+    /// resistor to ground that stands where a third control would — see
+    /// [`ToneStack::CLEAN_FIXED_MID`]. Loaded by the 1 MΩ volume pot.
     pub const fn or100_clean() -> Self {
         Self {
-            slope_resistor: 56_000.0,
-            treble_pot: 250_000.0,
+            slope_resistor: 100_000.0,
+            treble_pot: 1_000_000.0,
             bass_pot: 1_000_000.0,
-            mid_pot: 25_000.0,
+            mid_pot: 50_000.0,
             load_resistor: 1_000_000.0,
-            treble_cap: 250.0e-12,
+            treble_cap: 330.0e-12,
             bass_cap: 22.0e-9,
-            mid_cap: 22.0e-9,
+            mid_cap: 2.2e-9,
         }
     }
 }
@@ -181,13 +198,11 @@ pub struct ToneStack {
 impl ToneStack {
     /// Mid-pot rotation the clean channel's fixed mid resistor corresponds to.
     ///
-    /// 15 kΩ of the 25 kΩ mid element. A 2-band stack built on the classic
-    /// 6.8 kΩ value measures a 700 Hz/90 Hz ratio of 0.25 against the dirty
-    /// channel's 0.46 — i.e. it would be markedly *more* scooped than the
-    /// high-gain channel, which is the opposite of an Orange clean voicing.
-    /// 15 kΩ brings the ratio to 0.38 and leaves the clean channel full in the
-    /// low mids while keeping the bass/treble interaction intact.
-    pub const CLEAN_FIXED_MID: f32 = 15_000.0 / 25_000.0;
+    /// The factory schematic has no `Middle` control: a fixed 27 kΩ resistor
+    /// sits between the bass rheostat's bottom and ground, where this topology
+    /// puts the lower half of the mid pot. Against the 50 kΩ element in
+    /// [`ToneStackCircuit::or100_clean`] that is 27/50 of full rotation.
+    pub const CLEAN_FIXED_MID: f32 = 27_000.0 / 50_000.0;
 
     /// Creates a tone stack for the given component values. Call
     /// [`Self::prepare`] before processing.
@@ -386,14 +401,15 @@ impl ToneStack {
         let vc1 = apply(&self.reduced[2]);
         let vc2 = apply(&self.reduced[3]);
 
-        self.equivalent_current[CAP_TREBLE] =
-            flush(sanitize(self.double_conductance[CAP_TREBLE] * vc0 - i0));
+        self.equivalent_current[CAP_TREBLE] = flush(sanitize_volts(
+            self.double_conductance[CAP_TREBLE] * vc0 - i0,
+        ));
         self.equivalent_current[CAP_BASS] =
-            flush(sanitize(self.double_conductance[CAP_BASS] * vc1 - i1));
+            flush(sanitize_volts(self.double_conductance[CAP_BASS] * vc1 - i1));
         self.equivalent_current[CAP_MID] =
-            flush(sanitize(self.double_conductance[CAP_MID] * vc2 - i2));
+            flush(sanitize_volts(self.double_conductance[CAP_MID] * vc2 - i2));
 
-        sanitize(output)
+        sanitize_volts(output)
     }
 }
 
@@ -619,35 +635,64 @@ mod tests {
     }
 
     #[test]
-    fn clean_fixed_mid_resistor_fills_in_the_midrange() {
-        // The clean channel has no `Middle` control, so the fixed resistor is
-        // what sets its voicing. Compare against a near-shorted mid element,
-        // which is what a 2-band stack degenerates to if the value is wrong.
-        let mut shorted = clean_stack(0.05);
-        let mut fixed = clean_stack(ToneStack::CLEAN_FIXED_MID);
-
-        let shorted_scoop = response(&mut shorted, 700.0) / response(&mut shorted, 90.0);
-        let fixed_scoop = response(&mut fixed, 700.0) / response(&mut fixed, 90.0);
+    fn clean_stack_reproduces_the_factory_network() {
+        // The clean channel's stack is the OR100's own, component for
+        // component, so its measured character is a fact about the amplifier
+        // rather than a tuning choice: a light insertion loss, a treble
+        // control with wide authority, and a bass control that works below
+        // 400 Hz and does nothing above it.
+        let mut noon = clean_stack(ToneStack::CLEAN_FIXED_MID);
+        let loss = 20.0 * response(&mut noon, 800.0).log10();
         assert!(
-            fixed_scoop > shorted_scoop * 1.5,
-            "fixed mid did not fill the midrange: {shorted_scoop} -> {fixed_scoop}"
+            (-7.5..=-5.0).contains(&loss),
+            "insertion loss at 800 Hz was {loss} dB, not the factory network's ~-6 dB"
+        );
+
+        let swept = |treble: f32, bass: f32, frequency: f32| -> f32 {
+            let mut stack = clean_stack(ToneStack::CLEAN_FIXED_MID);
+            stack.set_controls(treble, bass, ToneStack::CLEAN_FIXED_MID);
+            20.0 * response(&mut stack, frequency).log10()
+        };
+
+        let treble_range = swept(0.95, 0.5, 5_000.0) - swept(0.05, 0.5, 5_000.0);
+        assert!(
+            treble_range > 8.0,
+            "treble control only spans {treble_range} dB at 5 kHz"
+        );
+
+        let bass_range = swept(0.5, 0.95, 90.0) - swept(0.5, 0.05, 90.0);
+        assert!(
+            bass_range > 4.0,
+            "bass control only spans {bass_range} dB at 90 Hz"
+        );
+
+        // And it is a bass control, not a broadband one: above the midrange
+        // the same sweep does nothing.
+        let bass_at_5k = (swept(0.5, 0.95, 5_000.0) - swept(0.5, 0.05, 5_000.0)).abs();
+        assert!(
+            bass_at_5k < 1.0,
+            "bass control moved 5 kHz by {bass_at_5k} dB"
         );
     }
 
     #[test]
     fn clean_two_band_stack_is_still_interactive() {
         // Losing the `Middle` control must not turn the remaining two into
-        // independent bands: `Bass` must still reload the treble branch.
-        let mut bass_down = clean_stack(ToneStack::CLEAN_FIXED_MID);
-        bass_down.set_controls(0.5, 0.05, ToneStack::CLEAN_FIXED_MID);
-        let mut bass_up = clean_stack(ToneStack::CLEAN_FIXED_MID);
-        bass_up.set_controls(0.5, 0.95, ToneStack::CLEAN_FIXED_MID);
+        // independent bands. In the factory network the coupling runs the
+        // other way from the dirty channel's: the treble pot's wiper is what
+        // loads the rest of the stack, so winding `Treble` up audibly thins
+        // the bottom end — 90 Hz drops by about 4.7 dB — even though `Treble`
+        // has no component in that branch at all.
+        let mut treble_down = clean_stack(ToneStack::CLEAN_FIXED_MID);
+        treble_down.set_controls(0.05, 0.5, ToneStack::CLEAN_FIXED_MID);
+        let mut treble_up = clean_stack(ToneStack::CLEAN_FIXED_MID);
+        treble_up.set_controls(0.95, 0.5, ToneStack::CLEAN_FIXED_MID);
 
-        let a = response(&mut bass_down, 700.0);
-        let b = response(&mut bass_up, 700.0);
+        let a = response(&mut treble_down, 90.0);
+        let b = response(&mut treble_up, 90.0);
         assert!(
-            ((b - a) / a).abs() > 0.05,
-            "clean stack shows no bass/mid interaction: {a} -> {b}"
+            b < a * 0.8,
+            "clean stack shows no treble/bass interaction: {a} -> {b}"
         );
     }
 

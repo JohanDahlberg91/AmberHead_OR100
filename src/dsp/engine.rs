@@ -5,10 +5,16 @@
 //! ```text
 //! In -> [8x Up] -> [Channel Switch]
 //!         Clean: V1 -> 2-band EQ -> Clean Volume
-//!         Dirty: V2 -> V3 -> V4 (Gain Boost) -> 3-band EQ -> Dirty Volume
-//!       -> [Global Boost +3 dB] -> [LTP PI] -> [EL34 Push-Pull] <- [B+ Sag]
+//!         Dirty: V2 -> Gain -> V3 -> V4 (Boost) -> V5 -> 3-band EQ -> Vol
+//!       -> [Global Boost +3 dB] -> [Driver V5] <- [Global NFB]
+//!       -> [LTP PI] -> [EL34 Push-Pull] <- [B+ Sag]
 //!       -> [8x Down] -> [Output Transformer] -> [Partitioned FFT Cab IR] -> Out
 //! ```
+//!
+//! The driver stage and the feedback loop around it are shared by both
+//! channels, as they are in the amplifier: the factory schematic has one
+//! preamp, and everything the channel switch selects arrives at the same
+//! 390 kΩ driver valve before the inverter.
 //!
 //! Everything from the channel switch to the power stage runs inside the 8x
 //! oversampled sub-pipeline; the transformer and cabinet run at the host rate,
@@ -22,9 +28,37 @@
 //! transformer secondary back into the host's normalized range. The interstage
 //! constants between them are the fixed dividers a real amplifier uses to keep
 //! each successive grid inside its operating window.
+//!
+//! All four dirty-channel triodes are always in circuit. The gain pot is a
+//! divider on V2's plate, so the dial's travel is spent driving the cascade
+//! progressively harder rather than switching stages in and out. Nothing in
+//! the chain clamps a plate node: a triode's swing is bounded by its own rail,
+//! which is what lets the top of the dial keep adding drive.
+//!
+//! The cascade is what makes this a high-gain channel rather than a crunch
+//! channel. What separates the two is not how hard the amplifier clips a
+//! struck note — two stages manage that — but how far into the decay it stays
+//! clipped. Each stage the gain pot drives multiplies the level reaching the
+//! next, so the dirty channel's three cascaded stages plus the shared driver
+//! hold saturation some 25 dB further down than a two-stage path does: the
+//! channel sustains instead of cleaning up as a note fades.
+//!
+//! # Relationship to the factory schematic
+//!
+//! Every component value here is read off the Orange OR 100 schematic, print
+//! HH A03057: 220 kΩ plate loads on 2.4 kΩ bypassed cathodes, a 390 kΩ driver
+//! on 1 kΩ, 22 nF coupling throughout, the 100 kΩ/330 pF/22 nF/2.2 nF/27 kΩ
+//! tone network, and the global feedback loop. Three things are deliberately
+//! not the schematic's, because the modern reissue this plugin models is not
+//! that amplifier: it has two channels where the original has one, a third
+//! cascade stage in the dirty channel where the original has none, and a
+//! long-tailed-pair inverter where the original uses a cathodyne. The pads
+//! between stages are named and derived from real dividers; the only free
+//! constants are the two makeup terms and [`DRIVER_TO_PI`], which exists
+//! solely to undo the voltage gain a cathodyne would not have contributed.
 
 use super::cabinet::Cabinet;
-use super::denormal::sanitize;
+use super::denormal::{flush, sanitize};
 use super::filters::SwitchRamp;
 use super::oversampling::Oversampler8x;
 use super::power::{PhaseInverter, PowerAmp, PowerMode};
@@ -42,43 +76,121 @@ pub const INPUT_DRIVE_VOLTS: f32 = 0.35;
 
 /// Final scaling from the transformer secondary into the host's normalized
 /// range, chosen so that a full-scale input on the default patch (dirty
-/// channel, gain 6.5, volume 5.0, 100 W) peaks at -2.7 dBFS: hot, but with
-/// the headroom for the loudest setting the front panel can reach — gain and
-/// volume both at 10 — to land at -0.3 dBFS rather than clipping the host bus.
-pub const OUTPUT_CALIBRATION: f32 = 0.34;
+/// channel, gain 6.5, volume 5.0, 100 W) peaks at -10.1 dBFS, and the loudest
+/// setting the front panel can reach — gain and volume at 10 with both boosts
+/// engaged — lands at -1.3 dBFS rather than clipping the host bus.
+pub const OUTPUT_CALIBRATION: f32 = 0.24;
 
 /// Divider between V1's plate and the clean channel's tone stack.
 const CLEAN_STACK_DRIVE: f32 = 0.35;
 /// Makeup applied after the clean tone stack's insertion loss, so the clean
-/// channel can still reach power-stage breakup at high volume settings.
+/// channel can still reach breakup at high volume settings.
 ///
-/// At 6.0 a full-scale input at volume 5 lands at -4.3 dBFS, which is level
-/// with the dirty channel rather than dropping away when the channel switch is
-/// thrown. That is a hot setting: the clean channel is already working the
-/// power stage at volume 5 and gains under a decibel between there and volume
-/// 10, so its top half is an edge-of-breakup range rather than a clean one —
-/// which is what an OR100's clean channel does, having no master volume of its
-/// own between the tone stack and the phase inverter.
-const CLEAN_MAKEUP: f32 = 6.0;
+/// The clean channel has no cascade behind it, so this constant alone decides
+/// how hard volume 10 drives the shared driver valve. At 0.85 the channel runs
+/// from -23.5 dBFS and 1.0 % distortion at volume 3 to -4.8 dBFS and 44 % at
+/// volume 10: recognisably clean to about 6, an edge-of-breakup range above
+/// it, and monotonic all the way up.
+const CLEAN_MAKEUP: f32 = 0.85;
 
-/// Fixed divider between V2's plate and the gain pot.
-const V2_TO_GAIN_POT: f32 = 0.5;
-/// Divider between V3's plate and the following stage.
-const V3_TO_V4: f32 = 0.06;
-/// Attenuation into V4 when the gain boost stage is engaged.
-const V4_DRIVE: f32 = 0.09;
-/// Trim on the path that skips V4, set so engaging the boost is a musical
-/// step of roughly +8 dB rather than the +30 dB the raw stage would give.
-const BOOST_BYPASS_TRIM: f32 = 1.7;
-/// Divider between the last preamp plate and the dirty tone stack.
-const DIRTY_STACK_DRIVE: f32 = 0.30;
-/// Makeup after the dirty tone stack's insertion loss.
+/// Loading of V2's plate by the 1 MΩ gain pot at full rotation.
 ///
-/// Calibrated so the default patch drives the power stage firmly into its
-/// non-linear region without pinning it: at 26.0 the EL34 stage limits so hard
-/// that the tone controls lose all audible authority, which a real amplifier
-/// does not do.
-const DIRTY_MAKEUP: f32 = 14.0;
+/// The pot sits directly on V2's coupling capacitor and is the whole load that
+/// plate sees, so at maximum the wiper carries `Rpot / (Rpot + Zplate)` of the
+/// plate signal: `1M / (1M + 48k) = 0.954`, where `Zplate = Ra || rp =
+/// 220k || 62k`. A cascade's gain pot is a divider, not an attenuator — at 10
+/// it hands the next grid essentially the entire plate swing.
+///
+/// The schematic wires its one volume pot in exactly this position, between
+/// the first and second triode, which is why the original's `Volume` is a
+/// gain control and not a master.
+const V2_TO_GAIN_POT: f32 = 0.954;
+
+/// Divider between V3's plate and V4's grid with the gain boost off.
+///
+/// 22 nF into a 390 kΩ + 82 kΩ series leg with a 100 kΩ shunt to ground.
+/// Against the 48 kΩ plate impedance and V4's own 1 MΩ grid leak in parallel
+/// with the shunt (`100k || 1M = 90.9k`) that is
+/// `90.9k / (48k + 472k + 90.9k) = 0.149`.
+///
+/// A high-gain cascade pads only lightly between stages. The pad's job is to
+/// stop the *loudest* notes from blocking the next grid solid, not to decide
+/// whether that grid clips at all — every note above a whisper is meant to
+/// clip it. Where it sits decides how far into a note's decay the cascade
+/// stays saturated: at this value the channel is clean at 1 on the dial,
+/// breaking up by 2, and at 10 holds saturation well below -30 dBFS of input.
+const V3_TO_V4: f32 = 0.149;
+
+/// The same divider with the gain boost engaged.
+///
+/// The switch shorts the 390 kΩ resistor, leaving the 82 kΩ grid stopper:
+/// `90.9k / (48k + 82k + 90.9k) = 0.412`, a +8.8 dB step. The boost changes
+/// how hard V4 is driven, not whether it is in circuit — every stage conducts
+/// in either switch position, which is what keeps the channel's voicing
+/// constant across the switch.
+const V3_TO_V4_BOOSTED: f32 = 0.412;
+
+/// Divider between V4's plate and V5's grid, the last pad in the cascade.
+///
+/// 22 nF into a 1 MΩ series resistor with a 68 kΩ shunt to ground:
+/// `63.7k / (48k + 1M + 63.7k) = 0.057`, where `63.7k = 68k || 1M`. Heavier
+/// than the pad ahead of V4, because V4 arrives already squared up: V5 is
+/// there to compress and sustain what the cascade has produced, and blocking
+/// its grid solid on every note would only smear the attack.
+const V4_TO_V5: f32 = 0.057;
+
+/// Divider between the last cascade plate and the dirty tone stack.
+///
+/// The stack hangs off V4's plate through the same 22 nF coupling capacitor;
+/// its 100 kΩ slope resistor and 1 MΩ pots load that plate almost as lightly
+/// as another grid would.
+const DIRTY_STACK_DRIVE: f32 = 0.90;
+
+/// Pad on the dirty channel between the volume pot and the driver's grid.
+///
+/// Three cascaded stages coupled at their real circuit ratios put tens of
+/// volts of square wave into the stack, so this constant *attenuates*: it
+/// stands in for the loading the volume pot's wiper and the driver's grid
+/// network apply. The channel's drive comes from the cascade, not from here.
+///
+/// With the cascade's own pads it sets where on the dial saturation arrives —
+/// 0.3 % distortion at 1, 17 % by 3, 81 % at 10 — and how far into a note's
+/// decay it holds: at 10 the channel is still at 25 % with only -34 dBFS of
+/// input, having compressed 26 dB of input range into 8 dB of output.
+const DIRTY_MAKEUP: f32 = 0.030;
+
+/// Divider between either channel's volume pot and the driver's grid.
+///
+/// 22 nF into a 68 kΩ grid stopper and the driver's 1 MΩ grid leak, fed from
+/// the volume pot's wiper: `1M / (1M + 68k) = 0.94` at the top of the dial.
+const VOLUME_TO_DRIVER: f32 = 0.94;
+
+/// Pad between the driver's plate and the phase inverter's grid.
+///
+/// This is the one constant with no counterpart on the schematic, and it is
+/// there because the inverter does not match either. The factory circuit ends
+/// in a cathodyne, which has no voltage gain: its driver has to supply the
+/// whole 30-odd volts an EL34 grid needs, which is exactly why that stage
+/// carries a 390 kΩ load and clips as early as it does. The long-tailed pair
+/// this plugin uses contributes roughly 30x of its own, so the driver's output
+/// is padded by about that much before it reaches the inverter's grid. Without
+/// it the amplifier would be an oscillator's worth of gain too hot, and the
+/// inverter would be blocking on every note.
+const DRIVER_TO_PI: f32 = 0.033;
+
+/// Fraction of the output transformer's secondary voltage fed back into the
+/// driver, from the schematic's global feedback loop.
+///
+/// The loop is a 24 kΩ resistor, shunted by 1 nF, into a 150 Ω resistor to
+/// ground: `beta = 150 / (24k + 150) = 0.0062`. The secondary swings about
+/// 40 V peak at full output on the 100 W setting, against a power stage whose
+/// normalized output reaches 2.0, so the volts arriving back at the driver are
+/// `0.0062 * 40/2 = 0.124` per unit of power-stage output.
+///
+/// The 1 nF across the 24 kΩ lifts the feedback above roughly 6.6 kHz, which
+/// is a presence rolloff rather than a flat loop; only the flat term is
+/// modelled here.
+const NFB_FACTOR: f32 = 0.124;
 
 /// Linear gain of the +3 dB global boost.
 const GLOBAL_BOOST_GAIN: f32 = 1.412_537_5;
@@ -143,7 +255,8 @@ pub struct SampleControls {
     pub dirty_treble: f32,
     /// Dirty volume, 0.0..=10.0.
     pub dirty_volume: f32,
-    /// Extra cascaded gain stage.
+    /// Shorts the 390 kOhm resistor in front of V4's grid for roughly 9 dB
+    /// more drive into the back half of the cascade.
     pub gain_boost: bool,
     /// +3 dB into the phase inverter.
     pub global_boost: bool,
@@ -187,8 +300,11 @@ pub struct AmpEngine {
     dirty_v2: Triode,
     dirty_v3: Triode,
     dirty_v4: Triode,
+    dirty_v5: Triode,
     dirty_stack: ToneStack,
 
+    /// Shared driver valve between the channel switch and the inverter.
+    driver: Triode,
     phase_inverter: PhaseInverter,
     power_amp: PowerAmp,
     transformer: OutputTransformer,
@@ -197,6 +313,11 @@ pub struct AmpEngine {
     channel_ramp: SwitchRamp,
     gain_boost_ramp: SwitchRamp,
     global_boost_ramp: SwitchRamp,
+
+    /// Feedback voltage from the previous sample's power-stage output.
+    nfb: f32,
+    /// Depth of the global feedback loop, [`NFB_FACTOR`] in normal operation.
+    nfb_factor: f32,
 
     /// Fraction of the nominal `B+` currently available.
     rail: f32,
@@ -227,11 +348,15 @@ impl AmpEngine {
             dirty_v2: Triode::new(StageCircuit::classic_gain_stage()),
             dirty_v3: Triode::new(StageCircuit::cascade_stage()),
             dirty_v4: Triode::new(StageCircuit::cascade_stage()),
+            dirty_v5: Triode::new(StageCircuit::cascade_stage()),
             dirty_stack: ToneStack::new(ToneStackCircuit::or100_dirty()),
+            driver: Triode::new(StageCircuit::driver_stage()),
             phase_inverter: PhaseInverter::new(),
             power_amp: PowerAmp::new(),
             transformer: OutputTransformer::new(),
             cabinet: Cabinet::new(),
+            nfb: 0.0,
+            nfb_factor: NFB_FACTOR,
             channel_ramp: SwitchRamp::default(),
             gain_boost_ramp: SwitchRamp::default(),
             global_boost_ramp: SwitchRamp::default(),
@@ -261,6 +386,9 @@ impl AmpEngine {
         self.dirty_v2.prepare(oversampled_rate);
         self.dirty_v3.prepare(oversampled_rate);
         self.dirty_v4.prepare(oversampled_rate);
+        self.dirty_v5.prepare(oversampled_rate);
+        self.driver.prepare(oversampled_rate);
+
         self.phase_inverter.prepare(oversampled_rate);
         self.power_amp.prepare(oversampled_rate);
         self.transformer.prepare(sample_rate);
@@ -315,7 +443,10 @@ impl AmpEngine {
         self.dirty_v2.reset();
         self.dirty_v3.reset();
         self.dirty_v4.reset();
+        self.dirty_v5.reset();
         self.dirty_stack.reset();
+        self.driver.reset();
+        self.nfb = 0.0;
         self.phase_inverter.reset();
         self.power_amp.reset();
         self.transformer.reset();
@@ -403,6 +534,14 @@ impl AmpEngine {
         self.rail
     }
 
+    /// Opens the global feedback loop, for tests that need an open-loop
+    /// reference. The loop cannot be defeated from outside the crate.
+    #[cfg(test)]
+    fn set_feedback_depth(&mut self, depth: f32) {
+        self.nfb_factor = depth;
+        self.nfb = 0.0;
+    }
+
     /// Processes one host-rate sample through the entire amplifier.
     #[inline]
     pub fn process_sample(&mut self, input: f32, controls: &SampleControls) -> f32 {
@@ -430,6 +569,10 @@ impl AmpEngine {
         let dirty_volume = audio_taper(knob_to_rotation(controls.dirty_volume));
         let gain = audio_taper(knob_to_rotation(controls.dirty_gain));
         let global_gain = 1.0 + (GLOBAL_BOOST_GAIN - 1.0) * global_mix;
+        // Gain boost shorts the pad in front of V4's grid; the ramp crossfades
+        // the divider ratio rather than the audio, so the stage never leaves
+        // the signal path and cannot click.
+        let v4_drive = V3_TO_V4 + (V3_TO_V4_BOOSTED - V3_TO_V4) * boost_mix;
 
         let driven = sanitize(input) * INPUT_DRIVE_VOLTS;
 
@@ -442,9 +585,13 @@ impl AmpEngine {
             dirty_v2,
             dirty_v3,
             dirty_v4,
+            dirty_v5,
             dirty_stack,
+            driver,
             phase_inverter,
             power_amp,
+            nfb,
+            nfb_factor,
             ..
         } = self;
 
@@ -462,33 +609,41 @@ impl AmpEngine {
                 0.0
             };
 
-            // --- Dirty channel: V2 -> V3 -> V4 -> 3-band EQ -> Volume -------
+            // --- Dirty: V2 -> V3 -> V4 -> V5 -> 3-band EQ -> Volume ---------
+            // Every stage is always in circuit. The gain pot sets how hard V2
+            // hits the cascade, and the boost switch shorts the series resistor
+            // in front of V4; the stack and the volume pot only ever attenuate
+            // what the cascade has already done.
             let dirty = if channel_mix > 0.0 {
                 let v2 = dirty_v2.process(sample);
                 let v3 = dirty_v3.process(v2 * gain * V2_TO_GAIN_POT);
-                let into_v4 = v3 * V3_TO_V4;
+                let v4 = dirty_v4.process(v3 * v4_drive);
+                let v5 = dirty_v5.process(v4 * V4_TO_V5);
 
-                // Gain boost crossfades the extra cascaded stage in and out.
-                let boosted = dirty_v4.process(into_v4 * V4_DRIVE);
-                let unboosted = into_v4 * BOOST_BYPASS_TRIM;
-                let combined = unboosted + (boosted - unboosted) * boost_mix;
-
-                let shaped = dirty_stack.process(combined * DIRTY_STACK_DRIVE);
+                let shaped = dirty_stack.process(v5 * DIRTY_STACK_DRIVE);
                 shaped * dirty_volume * DIRTY_MAKEUP
             } else {
                 dirty_v2.process(0.0);
                 dirty_v3.process(0.0);
                 dirty_v4.process(0.0);
+                dirty_v5.process(0.0);
                 dirty_stack.process(0.0);
                 0.0
             };
 
             let preamp = clean + (dirty - clean) * channel_mix;
 
-            // --- Global boost, phase inverter, power stage ------------------
-            let driven = preamp * global_gain;
-            let differential = phase_inverter.process(driven);
-            power_amp.process(differential)
+            // --- Driver, global feedback, phase inverter, power stage -------
+            // The schematic closes its feedback loop on the last small-signal
+            // stage, so the loop is subtracted at the driver's grid. The
+            // one-sample delay this costs is 2.6 µs at the oversampled rate,
+            // three orders of magnitude inside the loop's own bandwidth.
+            let driven = preamp * global_gain * VOLUME_TO_DRIVER - *nfb;
+            let driver_out = driver.process(driven);
+            let differential = phase_inverter.process(driver_out * DRIVER_TO_PI);
+            let power_output = power_amp.process(differential);
+            *nfb = flush(*nfb_factor * power_output);
+            power_output
         });
 
         // --- Host rate: transformer core, then the cabinet ------------------
@@ -563,6 +718,18 @@ mod tests {
     /// resonance and presence notch reshape the waveform enough to move
     /// peak-to-RMS by more than the clipping does.
     fn engine_thd_percent(controls: &SampleControls, amplitude: f32) -> f64 {
+        // The cabinet is bypassed for every distortion measurement. A speaker
+        // is linear: it cannot add or remove a single harmonic. What it does
+        // do is tilt the spectrum by tens of decibels, and since THD is a
+        // ratio of harmonic energy to the fundamental, that tilt moves the
+        // number without the amplifier's behaviour changing at all — fitting
+        // the cabinet to a measured 4x12 shifted these readings by a factor of
+        // three while the preamp was untouched. Bypassing it measures the
+        // amplifier, which is what these tests are about.
+        let controls = &SampleControls {
+            cab_enabled: false,
+            ..*controls
+        };
         let mut engine = prepared_engine(controls);
         let settle = (FS * 0.3) as usize;
         for n in 0..settle {
@@ -598,6 +765,203 @@ mod tests {
     }
 
     #[test]
+    fn gain_control_spans_clean_to_fully_saturated() {
+        // The four cascade stages are all in circuit, so the dial's travel is
+        // spent driving them progressively harder: a trace of grit at 1, well
+        // into clipping by 3, fully saturated at the top.
+        //
+        // Regression guard. When each triode's plate was clamped at ±32 V, V3
+        // pinned at the clamp by 4 on the dial and everything above it was
+        // bit-identical — the knob was dead over its whole upper half.
+        let thd = |gain: f32| {
+            engine_thd_percent(
+                &SampleControls {
+                    dirty_gain: gain,
+                    ..SampleControls::default()
+                },
+                0.2,
+            )
+        };
+
+        let (bottom, middle, upper, top) = (thd(1.0), thd(3.0), thd(5.0), thd(10.0));
+        assert!(bottom < 2.0, "gain 1 is not clean: {bottom}%");
+        assert!(middle > 10.0, "gain 3 has not broken up: {middle}%");
+        assert!(upper > 25.0, "gain 5 only reached {upper}%");
+        // Past the point where the cascade squares up, more drive buys
+        // compression and sustain rather than a higher harmonic ratio — the
+        // reading is not even monotonic up here, because grid blocking
+        // reshapes the waveform — so the top of the dial is checked against an
+        // absolute floor rather than against the rung below it.
+        assert!(top > 35.0, "the top of the dial only reached {top}% THD");
+    }
+
+    #[test]
+    fn saturation_survives_a_note_decaying_by_twenty_six_decibels() {
+        // What separates this amplifier from a 30 W crunch combo is not how
+        // hard it clips a struck note — any three-stage channel manages that —
+        // but how far into the decay it stays clipped. Four cascaded stages
+        // hold saturation some 25 dB further down than three do.
+        //
+        // The chain is checked at gain 10 against inputs 26 dB apart, -8 and
+        // -34 dBFS. Both must stay heavily distorted, and the output must
+        // compress hard: a fully saturated cascade barely changes level as the
+        // note fades, which is the sustain the amplifier is bought for.
+        let controls = SampleControls {
+            dirty_gain: 10.0,
+            ..SampleControls::default()
+        };
+
+        let struck = engine_thd_percent(&controls, 0.4);
+        let decayed = engine_thd_percent(&controls, 0.02);
+        assert!(struck > 40.0, "a struck note only reached {struck}%");
+        assert!(
+            decayed > 20.0,
+            "the channel cleaned up as the note decayed: {decayed}%"
+        );
+
+        let bare = SampleControls {
+            cab_enabled: false,
+            ..controls
+        };
+        let mut loud_engine = prepared_engine(&bare);
+        let mut quiet_engine = prepared_engine(&bare);
+        let loud = peak_for(&mut loud_engine, &bare, 0.4, 220.0);
+        let quiet = peak_for(&mut quiet_engine, &bare, 0.02, 220.0);
+        let compression = 20.0 * (loud / quiet.max(1.0e-9)).log10();
+        assert!(
+            compression < 12.0,
+            "26 dB of input became {compression} dB of output: not compressing"
+        );
+    }
+
+    #[test]
+    fn global_feedback_reduces_gain_rather_than_adding_it() {
+        // The schematic's loop is 24 kOhm into 150 Ohm off the transformer
+        // secondary, subtracted at the driver's grid. Sign errors in a
+        // feedback path are silent until the amplifier oscillates, so this
+        // pins the polarity: with the loop closed, small-signal gain must be
+        // *lower* than the same chain running open, and the amplifier must
+        // stay bounded when driven hard.
+        let controls = SampleControls {
+            dirty_gain: 3.0,
+            dirty_volume: 3.0,
+            ..SampleControls::default()
+        };
+
+        let mut closed = prepared_engine(&controls);
+        let with_loop = peak_for(&mut closed, &controls, 0.02, 220.0);
+
+        let mut open = prepared_engine(&controls);
+        open.set_feedback_depth(0.0);
+        let without_loop = peak_for(&mut open, &controls, 0.02, 220.0);
+
+        assert!(
+            with_loop < without_loop,
+            "feedback raised the gain: {without_loop} open -> {with_loop} closed"
+        );
+        let depth = 20.0 * (without_loop / with_loop.max(1.0e-9)).log10();
+        assert!(
+            (0.5..=6.0).contains(&depth),
+            "feedback depth measured {depth} dB, not the ~1.5 dB the divider is worth"
+        );
+    }
+
+    #[test]
+    fn gain_boost_is_a_drive_step_not_a_stage_swap() {
+        // The boost shorts the 390 kΩ resistor in front of V4's grid, so it is
+        // worth a fixed ~9 dB of extra drive rather than switching a whole
+        // stage in and out.
+        //
+        // Measured at the bottom of the gain dial, which is the only place the
+        // step shows up as level: anywhere above it the cascade is already
+        // clipping, and 9 dB more drive into a clipping stage buys distortion
+        // and compression instead. See
+        // [`Self::gain_boost_adds_saturation_when_the_cascade_is_clipping`].
+        let plain = SampleControls {
+            dirty_gain: 1.0,
+            ..SampleControls::default()
+        };
+        let boosted = SampleControls {
+            gain_boost: true,
+            ..plain
+        };
+        let mut a = prepared_engine(&plain);
+        let mut b = prepared_engine(&boosted);
+        let quiet = peak_for(&mut a, &plain, 0.2, 220.0);
+        let loud = peak_for(&mut b, &boosted, 0.2, 220.0);
+        let delta = 20.0 * (loud / quiet.max(1.0e-9)).log10();
+        assert!(
+            (7.0..=12.0).contains(&delta),
+            "gain boost stepped by {delta} dB, not the ~9 dB the pad is worth"
+        );
+    }
+
+    #[test]
+    fn a_fully_saturated_cascade_still_does_not_alias() {
+        // `CLAUDE.md` §5 aliasing test, applied to the whole amplifier at the
+        // setting that generates the most harmonic energy: four clipped stages
+        // plus a slammed power stage. The cabinet is bypassed so its 4.8 kHz
+        // rolloff cannot flatter the measurement.
+        //
+        // A 2.5 kHz fundamental puts its harmonics on multiples of 2.5 kHz and
+        // its folded images on 500 Hz, 2 kHz, 4.5 kHz, 7 kHz and 9.5 kHz —
+        // none of which is a harmonic, so anything measured there is aliasing.
+        let controls = SampleControls {
+            dirty_gain: 10.0,
+            gain_boost: true,
+            dirty_volume: 8.0,
+            cab_enabled: false,
+            ..SampleControls::default()
+        };
+        let mut engine = prepared_engine(&controls);
+
+        let settle = (FS * 0.3) as usize;
+        for n in 0..settle {
+            let x = 0.5 * (std::f32::consts::TAU * 2_500.0 * n as f32 / FS).sin();
+            engine.process_sample(x, &controls);
+        }
+        let count = 16_384usize;
+        let mut samples = Vec::with_capacity(count);
+        for n in 0..count {
+            let x = 0.5 * (std::f32::consts::TAU * 2_500.0 * (settle + n) as f32 / FS).sin();
+            samples.push(engine.process_sample(x, &controls) as f64);
+        }
+
+        let magnitude = |frequency: f64| -> f64 {
+            let (mut real, mut imag) = (0.0, 0.0);
+            for (index, sample) in samples.iter().enumerate() {
+                let t = index as f64 / count as f64;
+                let window = 0.5 - 0.5 * (std::f64::consts::TAU * t).cos();
+                let phase = std::f64::consts::TAU * frequency * index as f64 / FS as f64;
+                real += sample * window * phase.cos();
+                imag += sample * window * phase.sin();
+            }
+            (real * real + imag * imag).sqrt() / count as f64
+        };
+
+        let fundamental = magnitude(2_500.0).max(1.0e-12);
+        for alias in [500.0, 2_000.0, 4_500.0, 7_000.0, 9_500.0] {
+            let level = 20.0 * (magnitude(alias) / fundamental).log10();
+            assert!(level < -60.0, "alias at {alias} Hz was {level} dB");
+        }
+    }
+
+    #[test]
+    fn the_cascade_saturates_without_the_gain_boost() {
+        // All four stages are in circuit in both switch positions, so the
+        // channel reaches heavy saturation on the gain control alone. The
+        // boost is a hotter setting, not the difference between a crunch amp
+        // and a high-gain one.
+        let controls = SampleControls {
+            dirty_gain: 10.0,
+            gain_boost: false,
+            ..SampleControls::default()
+        };
+        let thd = engine_thd_percent(&controls, 0.2);
+        assert!(thd > 35.0, "unboosted cascade only reached {thd}%");
+    }
+
+    #[test]
     fn clean_channel_is_cleaner_than_the_dirty_channel() {
         let dirty_controls = SampleControls::default();
         let clean_controls = SampleControls {
@@ -627,7 +991,7 @@ mod tests {
         };
         let low = engine_thd_percent(&quiet, 0.2);
         let high = engine_thd_percent(&loud, 0.2);
-        assert!(low < 2.0, "gain 1 already distorting at {low}%");
+        assert!(low < 5.0, "gain 1 already distorting at {low}%");
         assert!(high > low * 5.0, "gain 9 only reached {high}% vs {low}%");
     }
 
@@ -644,35 +1008,76 @@ mod tests {
     }
 
     #[test]
-    fn gain_control_monotonically_increases_drive() {
-        let mut previous = 0.0f32;
-        for gain in [1.0f32, 3.0, 5.0, 8.0, 10.0] {
+    fn gain_control_drives_harder_until_the_amplifier_compresses() {
+        // Cabinet bypassed for the same reason as `engine_thd_percent`: the
+        // speaker's spectral tilt moves the level of a distorted waveform
+        // around by more than the gain control does near the top of its
+        // travel, so with it in circuit this measures the cabinet.
+        //
+        // The dial raises the output through its useful range and then stops,
+        // which is not a defect but the behaviour being modelled: once the
+        // cascade is fully saturated the ceiling is set by the amplifier, and
+        // further drive goes into grid blocking, which if anything costs a
+        // little level. A captured Orange shows the same thing — its output
+        // moves under half a decibel across a 26 dB change of input. So the
+        // bottom of the dial must climb, and the top must hold station rather
+        // than collapse.
+        let level = |gain: f32| -> f32 {
             let controls = SampleControls {
                 dirty_gain: gain,
+                cab_enabled: false,
                 ..SampleControls::default()
             };
             let mut engine = prepared_engine(&controls);
-            let peak = peak_for(&mut engine, &controls, 0.3, 220.0);
+            let settle = (FS * 0.3) as usize;
+            for n in 0..settle {
+                let x = 0.3 * (std::f32::consts::TAU * 220.0 * n as f32 / FS).sin();
+                engine.process_sample(x, &controls);
+            }
+            let count = (FS * 0.2) as usize;
+            let mut sum = 0.0f64;
+            for n in 0..count {
+                let x = 0.3 * (std::f32::consts::TAU * 220.0 * (settle + n) as f32 / FS).sin();
+                let y = engine.process_sample(x, &controls) as f64;
+                sum += y * y;
+            }
+            (sum / count as f64).sqrt() as f32
+        };
+
+        let (one, two, three) = (level(1.0), level(2.0), level(3.0));
+        assert!(
+            two > one * 2.0,
+            "gain 1 -> 2 gained nothing: {one} -> {two}"
+        );
+        assert!(three > two, "gain 2 -> 3 gained nothing: {two} -> {three}");
+
+        for gain in [5.0f32, 8.0, 10.0] {
+            let held = level(gain);
+            let drop_db = 20.0 * (three / held).log10();
             assert!(
-                peak >= previous * 0.98,
-                "gain {gain} produced {peak}, below the previous {previous}"
+                drop_db < 2.5,
+                "gain {gain} fell {drop_db} dB below gain 3: the top of the dial is collapsing"
             );
-            previous = peak;
         }
     }
 
     #[test]
-    fn gain_boost_adds_level() {
+    fn gain_boost_adds_saturation_when_the_cascade_is_clipping() {
+        // On the default patch the cascade is already well into clipping, so
+        // the boost's extra drive comes out as harmonic content rather than as
+        // level — the same thing a real amplifier does once its preamp is
+        // squared up.
         let plain = SampleControls::default();
         let boosted = SampleControls {
             gain_boost: true,
             ..SampleControls::default()
         };
-        let mut a = prepared_engine(&plain);
-        let mut b = prepared_engine(&boosted);
-        let quiet = peak_for(&mut a, &plain, 0.2, 220.0);
-        let loud = peak_for(&mut b, &boosted, 0.2, 220.0);
-        assert!(loud > quiet, "gain boost did nothing: {quiet} -> {loud}");
+        let quiet = engine_thd_percent(&plain, 0.2);
+        let loud = engine_thd_percent(&boosted, 0.2);
+        assert!(
+            loud > quiet * 1.3,
+            "gain boost did nothing: {quiet}% -> {loud}%"
+        );
     }
 
     #[test]

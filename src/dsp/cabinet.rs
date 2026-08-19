@@ -93,28 +93,50 @@ const NORMALISATION_POINTS: usize = 33;
 /// amplify whatever noise it does contain into the signal path.
 const NORMALISATION_LIMIT_DB: f32 = 40.0;
 
+// The constants below were fitted against a measured impulse response of an
+// Orange 4x12 with Celestion V30s, close-miked with an SM57. The fit minimises
+// the weighted error across 23 third-octave bands from 60 Hz to 10 kHz and
+// lands at 1.6 dB RMS, against 8.4 dB for the values this cabinet carried
+// before the measurement was available.
+//
+// The single largest correction was the low end. A real 4x12 sits 5..10 dB
+// *above* its 1 kHz level across the whole 130..800 Hz range, and the chain
+// had no shelving section to produce that plateau, so it ran 11..14 dB light
+// through the entire low midrange — the body of the instrument. The second was
+// the presence region, where an 8 dB notch at 3.6 kHz turned out to be roughly
+// three times deeper than the measurement supports.
+
 /// Driver/enclosure resonance: the low-frequency corner of a closed 4x12.
-const RESONANCE_HZ: f32 = 85.0;
+/// The measured cabinet peaks at 129 Hz.
+const RESONANCE_HZ: f32 = 123.0;
 /// `Q` of that resonance; above 0.707 so it leaves the characteristic bump
 /// just above the corner.
-const RESONANCE_Q: f32 = 1.15;
+const RESONANCE_Q: f32 = 1.23;
 /// Voice-coil inductance rolloff, applied as two cascaded poles for the
-/// 24 dB/octave slope a guitar speaker actually shows above 5 kHz.
-const ROLLOFF_HZ: f32 = 4_800.0;
-const ROLLOFF_Q_FIRST: f32 = 0.54;
-const ROLLOFF_Q_SECOND: f32 = 1.31;
+/// 24 dB/octave slope a guitar speaker actually shows above 5 kHz. The
+/// measurement crosses -10 dB at 5.9 kHz.
+const ROLLOFF_HZ: f32 = 4_660.0;
+const ROLLOFF_Q_FIRST: f32 = 0.80;
+const ROLLOFF_Q_SECOND: f32 = 1.48;
 /// Cone-breakup peak — the forward upper-midrange character of a V30.
-const BREAKUP_HZ: f32 = 2_300.0;
-const BREAKUP_Q: f32 = 2.4;
-const BREAKUP_GAIN_DB: f32 = 5.5;
+const BREAKUP_HZ: f32 = 2_475.0;
+const BREAKUP_Q: f32 = 2.19;
+const BREAKUP_GAIN_DB: f32 = 5.7;
 /// Off-axis cancellation notch a closed 4x12 shows in the presence region.
-const NOTCH_HZ: f32 = 3_600.0;
-const NOTCH_Q: f32 = 3.5;
-const NOTCH_GAIN_DB: f32 = -8.0;
-/// Lower-midrange dip that keeps the cab from sounding boxy.
-const BODY_HZ: f32 = 430.0;
-const BODY_Q: f32 = 1.1;
-const BODY_GAIN_DB: f32 = -3.5;
+const NOTCH_HZ: f32 = 3_180.0;
+const NOTCH_Q: f32 = 3.2;
+const NOTCH_GAIN_DB: f32 = -2.4;
+/// Lower-midrange dip that keeps the cab from sounding boxy. It shapes the
+/// top of the shelf below rather than cutting into the 1 kHz reference.
+const BODY_HZ: f32 = 435.0;
+const BODY_Q: f32 = 1.67;
+const BODY_GAIN_DB: f32 = -6.0;
+/// Low-frequency shelf: the broad plateau a 4x12 holds from its tuning
+/// frequency up into the midrange. This is where the cabinet's weight comes
+/// from, and no combination of peaking sections reproduces it.
+const SHELF_HZ: f32 = 711.0;
+const SHELF_Q: f32 = 1.07;
+const SHELF_GAIN_DB: f32 = 13.6;
 /// Early cabinet reflection: delay in seconds and its relative level.
 /// 0.36 ms is roughly the round trip across a 4x12's internal depth.
 const REFLECTION_SECONDS: f32 = 0.000_36;
@@ -199,6 +221,7 @@ pub fn synthesise_4x12_ir(sample_rate: f32) -> Vec<f32> {
         Biquad::peaking(BREAKUP_HZ, BREAKUP_Q, BREAKUP_GAIN_DB, sample_rate),
         Biquad::peaking(NOTCH_HZ, NOTCH_Q, NOTCH_GAIN_DB, sample_rate),
         Biquad::peaking(BODY_HZ, BODY_Q, BODY_GAIN_DB, sample_rate),
+        Biquad::low_shelf(SHELF_HZ, SHELF_Q, SHELF_GAIN_DB, sample_rate),
     ];
 
     let mut direct = vec![0.0f32; IR_LENGTH];
@@ -827,15 +850,39 @@ mod tests {
         let ir = synthesise_4x12_ir(FS);
         let low = ir_response_db(&ir, 40.0);
         let body = ir_response_db(&ir, 250.0);
+        let reference = ir_response_db(&ir, 1_000.0);
         let presence = ir_response_db(&ir, BREAKUP_HZ);
         let air = ir_response_db(&ir, 12_000.0);
 
         assert!(low < body - 8.0, "40 Hz only {low} dB vs body {body} dB");
         assert!(air < body - 25.0, "12 kHz only {air} dB vs body {body} dB");
+        // The cone-breakup peak is a lift over the *midrange*, not over the
+        // low end. A measured 4x12 sits some 7 dB above its 1 kHz level at
+        // 250 Hz, so the body is louder than the presence region in absolute
+        // terms; comparing the two directly measures the low shelf instead.
         assert!(
-            presence > body,
-            "no cone-breakup lift: {presence} dB vs {body} dB"
+            presence > reference,
+            "no cone-breakup lift: {presence} dB vs {reference} dB at 1 kHz"
         );
+    }
+
+    #[test]
+    fn ir_carries_the_low_shelf_a_measured_4x12_shows() {
+        // Regression guard for the largest error the measurement exposed. The
+        // synthesised cabinet once ran 11..14 dB light across the whole
+        // 130..800 Hz band, because the chain had no shelving section and a
+        // plateau that wide cannot be built from peaking filters. That is the
+        // body of the instrument, and without it the amplifier sounds thin
+        // however the preamp is voiced.
+        let ir = synthesise_4x12_ir(FS);
+        let reference = ir_response_db(&ir, 1_000.0);
+        for (frequency, floor) in [(130.0, 5.0), (200.0, 5.0), (400.0, 2.0), (630.0, 1.0)] {
+            let level = ir_response_db(&ir, frequency) - reference;
+            assert!(
+                level > floor,
+                "{frequency} Hz sits {level} dB over 1 kHz, under the {floor} dB the measurement shows"
+            );
+        }
     }
 
     #[test]

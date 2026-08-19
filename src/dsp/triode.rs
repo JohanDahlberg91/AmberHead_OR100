@@ -34,7 +34,7 @@
 //! time than interpolating a raw 2D `(Vgk, Vpk)` current surface, because the
 //! run-time path performs no iteration at all.
 
-use super::denormal::{flush, sanitize};
+use super::denormal::{flush, sanitize_volts};
 use super::filters::{DcBlocker, OnePoleLp};
 
 /// Number of entries in the solved plate-voltage table.
@@ -192,14 +192,32 @@ pub struct StageCircuit {
 }
 
 impl StageCircuit {
-    /// A conventional 12AX7 gain stage: 100 kΩ plate load off a 300 V rail,
-    /// 1.5 kΩ cathode resistor fully bypassed by 22 µF.
+    /// The OR100's standard 12AX7 gain stage, read off the factory schematic
+    /// (Orange OR 100, print HH A03057).
+    ///
+    /// 220 kΩ plate load (`M22`) off the 320 V preamp node, 2.4 kΩ cathode
+    /// resistor fully bypassed by 50 µF. Both triodes of the first ECC83 are
+    /// wired this way; the second differs only in carrying a 60 µF bypass.
+    ///
+    /// The 220 kΩ load is what makes an Orange preamp stage hotter than the
+    /// 100 kΩ a Marshall or Fender front end uses: it lands the stage at 70x
+    /// against their ~60x, with a lower quiescent plate (184 V) and so less
+    /// room before the plate bottoms out.
+    ///
+    /// The supply is the node behind the 33 kΩ/10 kΩ dropping chain that feeds
+    /// the preamp from the main rail; its 32 µF reservoir is rated 385 V, so
+    /// the node sits below that.
+    ///
+    /// The bypass corner follows from the cap and the impedance at the
+    /// cathode: `fc = 1 / (2*pi*(Rk || 1/gm)*Ck)`, and at this operating point
+    /// `gm ~ 1.6 mA/V`, so `Rk || 1/gm = 2k4 || 625 = 496 Ω` and 50 µF puts
+    /// the corner at 6.4 Hz — below the audio band, i.e. full gain everywhere.
     pub const fn classic_gain_stage() -> Self {
         Self {
-            plate_resistor: 100_000.0,
-            supply_voltage: 300.0,
-            cathode_resistor: 1_500.0,
-            cathode_bypass_hz: 16.0,
+            plate_resistor: 220_000.0,
+            supply_voltage: 320.0,
+            cathode_resistor: 2_400.0,
+            cathode_bypass_hz: 6.4,
             coupling_cap: 22.0e-9,
             grid_leak: 1.0e6,
             grid_conduction_resistance: 2_200.0,
@@ -207,14 +225,47 @@ impl StageCircuit {
         }
     }
 
-    /// A cascaded overdrive stage: 100 kΩ plate load, 820 Ω cathode resistor
-    /// with a small 0.68 µF bypass cap that rolls the low end off below
-    /// ~470 Hz, which is what keeps a high-gain channel from turning to mud.
+    /// The driver stage that feeds the phase inverter, from the same schematic.
+    ///
+    /// 390 kΩ plate load (`M39`) and a 1 kΩ cathode resistor. The schematic
+    /// bypasses that resistor through the front panel's 50 kΩ `Boost` pot in
+    /// series with 0.1 µF, which only bypasses above about 4 kHz — a top-end
+    /// emphasis rather than a gain control — so the corner here is set for the
+    /// bypassed case and the pot's position is not modelled.
+    ///
+    /// This is the hottest stage in the amplifier: the 390 kΩ load pulls the
+    /// quiescent plate down to 98 V and the bias to -0.57 V, for 84x of gain
+    /// and barely half a volt of grid headroom. It is meant to clip, and in
+    /// the original it clips *hard*, because the cathodyne inverter it feeds
+    /// has no gain of its own and the EL34 grids still need tens of volts.
+    pub const fn driver_stage() -> Self {
+        Self {
+            plate_resistor: 390_000.0,
+            supply_voltage: 320.0,
+            cathode_resistor: 1_000.0,
+            cathode_bypass_hz: 4_100.0,
+            coupling_cap: 22.0e-9,
+            grid_leak: 1.0e6,
+            grid_conduction_resistance: 2_200.0,
+            miller_cutoff_hz: 38_000.0,
+        }
+    }
+
+    /// The extra cascade stage the dirty channel adds over the schematic's
+    /// three, kept on the schematic's 220 kΩ plate load but with a smaller
+    /// bypass capacitor.
+    ///
+    /// The factory circuit trims the low end once, at the input, with the
+    /// `Depth` rotary switch; a channel with a fourth stage in front of the
+    /// tone stack has to trim it again or the cascade turns to mud. A 0.68 µF
+    /// bypass on the 2.4 kΩ cathode puts the corner at 470 Hz, so the stage
+    /// runs at full gain through the midrange and sheds the bottom octaves
+    /// before they reach the next grid.
     pub const fn cascade_stage() -> Self {
         Self {
-            plate_resistor: 100_000.0,
-            supply_voltage: 300.0,
-            cathode_resistor: 820.0,
+            plate_resistor: 220_000.0,
+            supply_voltage: 320.0,
+            cathode_resistor: 2_400.0,
             cathode_bypass_hz: 470.0,
             coupling_cap: 22.0e-9,
             grid_leak: 1.0e6,
@@ -450,13 +501,17 @@ impl Triode {
 
         // 5. Miller pole, then DC blocking.
         let signal = self.miller.process(plate - self.quiescent_plate);
-        sanitize(self.dc_blocker.process(signal))
+        // Circuit volts, not normalized audio: a stage driven into cutoff
+        // presents its whole plate swing to the next grid, so this is bounded
+        // by the rail rather than by an audio-level ceiling.
+        sanitize_volts(self.dc_blocker.process(signal))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsp::denormal::VOLTAGE_LIMIT;
 
     /// 8x of a 48 kHz host rate, the rate every preamp stage actually runs at.
     const OS_RATE: f32 = 384_000.0;
@@ -553,24 +608,33 @@ mod tests {
 
     #[test]
     fn quiescent_point_matches_a_measured_preamp_stage() {
-        let stage = prepared_stage(StageCircuit::classic_gain_stage());
+        let circuit = StageCircuit::classic_gain_stage();
+        let stage = prepared_stage(circuit);
         let bias = stage.quiescent_bias();
         let plate = stage.quiescent_plate();
         let current =
-            (300.0 - plate) / StageCircuit::classic_gain_stage().plate_resistor as f32 * 1.0e3;
+            (circuit.supply_voltage as f32 - plate) / circuit.plate_resistor as f32 * 1.0e3;
 
-        // A 100 kOhm / 1.5 kOhm / 300 V stage — the front end of every
-        // Orange and Marshall preamp — measures around 1 mA of plate current,
-        // 200 V on the plate and 1.4 V on the cathode. The model lands at
-        // 0.98 mA / 202.4 V / 1.46 V.
-        assert!((-1.7..=-1.2).contains(&bias), "bias solved to {bias} V");
+        // The OR100's 220 kOhm / 2.4 kOhm stage off its ~320 V preamp node.
+        // A 220 kOhm load draws about half the current of the 100 kOhm one a
+        // Marshall front end uses and idles lower on the load line: the model
+        // lands at 0.62 mA / 184 V / 1.48 V, and the cathode voltage it solves
+        // for is self-consistent with the 2.4 kOhm resistor (0.62 mA * 2k4 =
+        // 1.48 V), which is the check that matters — the bias is not asserted
+        // independently of the current that produces it.
+        assert!((-1.7..=-1.3).contains(&bias), "bias solved to {bias} V");
         assert!(
-            (190.0..=215.0).contains(&plate),
+            (172.0..=196.0).contains(&plate),
             "plate solved to {plate} V"
         );
         assert!(
-            (0.85..=1.15).contains(&current),
+            (0.52..=0.72).contains(&current),
             "plate current solved to {current} mA"
+        );
+        let cathode_from_current = current * 1.0e-3 * circuit.cathode_resistor as f32;
+        assert!(
+            (cathode_from_current + bias).abs() < 0.02,
+            "bias {bias} V disagrees with {cathode_from_current} V across Rk"
         );
     }
 
@@ -696,7 +760,13 @@ mod tests {
         // High-drive case: the stage now clips against cutoff on one side and
         // grid conduction on the other, so odd orders appear too — but the
         // asymmetry keeps the second harmonic on top.
-        let levels = harmonics_db(3.0, &[2, 3, 4]);
+        //
+        // 8 V is what it takes to engage *both* limits on a stage biased at
+        // -1.46 V: at 3 V only the grid-conduction side is clamped, and the
+        // one-sided clipping that produces is almost purely even-order
+        // (2nd -8.8 dB, 3rd -36.8 dB). Odd content is evidence of symmetric
+        // clipping, so the drive has to be high enough to reach cutoff too.
+        let levels = harmonics_db(8.0, &[2, 3, 4]);
         let second = levels.first().copied().unwrap_or(f64::NEG_INFINITY);
         let third = levels.get(1).copied().unwrap_or(f64::NEG_INFINITY);
         let fourth = levels.get(2).copied().unwrap_or(f64::NEG_INFINITY);
@@ -755,12 +825,75 @@ mod tests {
         for x in [1.0e6f32, -1.0e6, f32::MAX, f32::MIN] {
             let y = stage.process(x);
             assert!(y.is_finite(), "input {x} produced {y}");
-            assert!(y.abs() <= 32.0);
+            // Bounded by the containment limit, not by an audio-level ceiling:
+            // this node carries circuit volts. The plate table itself is
+            // bracketed by the 300 V rail, so the observed excursion here is
+            // ~78 V — the DC blocker's transient response to a step, not a
+            // runaway.
+            assert!(y.abs() <= VOLTAGE_LIMIT, "input {x} produced {y} V");
         }
         // And it must still work normally afterwards.
         for _ in 0..1_000 {
             assert!(stage.process(0.0).is_finite());
         }
+    }
+
+    #[test]
+    fn plate_swing_is_not_capped_at_the_normalized_audio_ceiling() {
+        // Regression guard: the stage output was once passed through the
+        // normalized-audio `sanitize()`, which brick-wall clipped every plate
+        // at ±32 V. That is a third of this stage's real swing, and cascading
+        // two of them meant the second stage could never be driven past its
+        // own clipping point no matter where the gain pot sat.
+        let mut stage = prepared_stage(StageCircuit::cascade_stage());
+        let mut peak = 0.0f32;
+        let total = OS_RATE as usize / 10;
+        for n in 0..total {
+            let x = 5.0 * (std::f32::consts::TAU * 500.0 * n as f32 / OS_RATE).sin();
+            let y = stage.process(x);
+            if n > total / 2 {
+                peak = peak.max(y.abs());
+            }
+        }
+        // A stage biased at -1.03 V off a 300 V rail, slammed with 5 V, swings
+        // most of the way between cutoff and saturation.
+        assert!(peak > 100.0, "hard-driven plate only reached {peak} V");
+        assert!(peak < 300.0, "plate exceeded its own supply: {peak} V");
+    }
+
+    #[test]
+    fn stage_operating_points_match_the_factory_schematic() {
+        // Values read off the Orange OR 100 schematic, print HH A03057, run
+        // through the Koren model. These are the numbers the gain staging in
+        // `crate::dsp::engine` is calibrated against, so a change to either
+        // stage's components should fail here before it silently rebalances
+        // the whole amplifier.
+        let gain_stage = prepared_stage(StageCircuit::classic_gain_stage());
+        assert!(
+            (-1.6..=-1.35).contains(&gain_stage.quiescent_bias()),
+            "220k/2k4 stage biased at {} V",
+            gain_stage.quiescent_bias()
+        );
+        assert!(
+            (175.0..=195.0).contains(&gain_stage.quiescent_plate()),
+            "220k/2k4 stage idles at {} V",
+            gain_stage.quiescent_plate()
+        );
+
+        // The driver is the hot one: a 390 kΩ load pulls its plate down near
+        // 100 V and leaves it barely half a volt of grid headroom.
+        let driver = prepared_stage(StageCircuit::driver_stage());
+        assert!(
+            (-0.7..=-0.45).contains(&driver.quiescent_bias()),
+            "390k/1k driver biased at {} V",
+            driver.quiescent_bias()
+        );
+        assert!(
+            driver.quiescent_plate() < gain_stage.quiescent_plate() - 60.0,
+            "driver idles at {} V, not far below the gain stage's {} V",
+            driver.quiescent_plate(),
+            gain_stage.quiescent_plate()
+        );
     }
 
     #[test]

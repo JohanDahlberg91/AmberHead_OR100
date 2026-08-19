@@ -155,10 +155,37 @@ pub fn flush(x: f32) -> f32 {
 ///
 /// The `±32.0` bound is ~+30 dBFS: far above any musically meaningful level the
 /// chain produces, so it never engages during normal operation.
+///
+/// This bound applies only to *normalized* audio. Nodes carrying real circuit
+/// voltages — every triode plate, the phase-inverter legs, the tone stack —
+/// swing hundreds of volts and must use [`sanitize_volts`] instead; clamping
+/// them at 32 V would hard-limit the amplifier well below its own headroom.
 #[inline(always)]
 pub fn sanitize(x: f32) -> f32 {
     if x.is_finite() {
         x.clamp(-32.0, 32.0)
+    } else {
+        0.0
+    }
+}
+
+/// Largest magnitude, in volts, any node inside the amplifier may reach.
+///
+/// The highest supply in the model is the 480 V power-stage rail; a preamp
+/// plate hangs off 300 V and can only swing between ground and its supply.
+/// 600 V therefore sits above every physically reachable node voltage while
+/// still bounding a numerical blow-up to something finite.
+pub const VOLTAGE_LIMIT: f32 = 600.0;
+
+/// [`sanitize`] for signals expressed in real circuit volts.
+///
+/// Same `NaN`/`Inf` containment, but bounded by [`VOLTAGE_LIMIT`] rather than
+/// by a normalized-audio ceiling, so a triode driven into cutoff can present
+/// its full plate swing to the next stage instead of being brick-wall clipped.
+#[inline(always)]
+pub fn sanitize_volts(x: f32) -> f32 {
+    if x.is_finite() {
+        x.clamp(-VOLTAGE_LIMIT, VOLTAGE_LIMIT)
     } else {
         0.0
     }
@@ -186,6 +213,19 @@ mod tests {
         assert_eq!(sanitize(1.0e9), 32.0);
         assert_eq!(sanitize(-1.0e9), -32.0);
         assert_eq!(sanitize(0.25), 0.25);
+    }
+
+    #[test]
+    fn sanitize_volts_contains_blow_ups_without_clipping_plate_swings() {
+        assert_eq!(sanitize_volts(f32::NAN), 0.0);
+        assert_eq!(sanitize_volts(f32::INFINITY), 0.0);
+        assert_eq!(sanitize_volts(f32::NEG_INFINITY), 0.0);
+        assert_eq!(sanitize_volts(1.0e9), VOLTAGE_LIMIT);
+        assert_eq!(sanitize_volts(-1.0e9), -VOLTAGE_LIMIT);
+        // A 12AX7 plate cut off from a 300 V rail swings ~100 V above its
+        // quiescent point; that must pass through untouched.
+        assert_eq!(sanitize_volts(105.0), 105.0);
+        assert_eq!(sanitize_volts(-150.0), -150.0);
     }
 
     #[test]

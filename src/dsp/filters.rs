@@ -268,6 +268,27 @@ impl Biquad {
         )
     }
 
+    /// Constant-slope low shelf via the RBJ cookbook bilinear design.
+    ///
+    /// Approaches `gain_db` below `cutoff_hz` and unity above it. A guitar
+    /// speaker's low-mid weight is a shelf, not a resonance: the measured
+    /// response of a 4x12 sits several dB above its 1 kHz level from the
+    /// cabinet's tuning frequency all the way up to the midrange, and no
+    /// combination of peaking sections reproduces that plateau.
+    pub fn low_shelf(cutoff_hz: f32, q: f32, gain_db: f32, sample_rate: f32) -> Self {
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let (alpha, cos_w0) = Self::rbj_common(cutoff_hz, q, sample_rate);
+        let shelf_alpha = 2.0 * a.sqrt() * alpha;
+        let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + shelf_alpha;
+        Self::from_coefficients(
+            a * ((a + 1.0) - (a - 1.0) * cos_w0 + shelf_alpha) / a0,
+            2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0) / a0,
+            a * ((a + 1.0) - (a - 1.0) * cos_w0 - shelf_alpha) / a0,
+            -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0) / a0,
+            ((a + 1.0) + (a - 1.0) * cos_w0 - shelf_alpha) / a0,
+        )
+    }
+
     /// Shared `alpha` and `cos(w0)` terms of the RBJ designs. The cutoff is
     /// clamped to 45 % of Nyquist so a badly-behaved caller cannot produce an
     /// unstable pole pair.
@@ -371,10 +392,48 @@ mod tests {
             Biquad::highpass(85.0, 1.2, FS),
             Biquad::lowpass(4_800.0, 0.707, FS),
             Biquad::peaking(2_200.0, 2.0, 6.0, FS),
+            Biquad::low_shelf(700.0, 1.07, 13.6, FS),
         ] {
             assert!(filter.a2.abs() < 1.0);
             assert!(filter.a1.abs() < 1.0 + filter.a2);
         }
+    }
+
+    #[test]
+    fn low_shelf_lifts_the_bottom_and_leaves_the_top_alone() {
+        // Quadrature correlation rather than peak-of-samples: at 8 kHz a
+        // 48 kHz sine has six samples per cycle, and the largest *sample* can
+        // sit a decibel below the true peak.
+        let gain_at = |frequency: f32| -> f32 {
+            let mut filter = Biquad::low_shelf(700.0, 1.07, 13.6, FS);
+            let settle = (FS / frequency * 20.0) as usize;
+            let measure = (FS / frequency * 40.0) as usize;
+            for n in 0..settle {
+                filter.process((std::f32::consts::TAU * frequency * n as f32 / FS).sin());
+            }
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for n in 0..measure {
+                let phase = std::f32::consts::TAU * frequency * (settle + n) as f32 / FS;
+                let y = filter.process(phase.sin()) as f64;
+                let angle = std::f64::consts::TAU * frequency as f64 * n as f64 / FS as f64;
+                re += y * angle.cos();
+                im += y * angle.sin();
+            }
+            let magnitude = 2.0 * (re * re + im * im).sqrt() / measure as f64;
+            20.0 * magnitude.log10() as f32
+        };
+
+        // Deep in the shelf the gain is the full 13.6 dB; well above the
+        // corner the filter is transparent; the corner itself sits near half.
+        let low = gain_at(60.0);
+        let high = gain_at(8_000.0);
+        let corner = gain_at(700.0);
+        assert!((low - 13.6).abs() < 0.6, "shelf floor was {low} dB");
+        assert!(high.abs() < 0.3, "shelf coloured 8 kHz by {high} dB");
+        assert!(
+            (2.0..=12.0).contains(&corner),
+            "corner gain {corner} dB is not between the two plateaus"
+        );
     }
 
     #[test]
